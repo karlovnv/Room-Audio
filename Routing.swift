@@ -376,6 +376,7 @@ final class RoutingWorkspace: ObservableObject {
     let clock = SharedPTP()
     let synchronizedGroup = SynchronizedGroup()
     let savedGroups: SpeakerGroups
+    let bluetoothGroups: BluetoothGroups
     @Published private(set) var routes: [RouteDestination.ID: OutputRoute] = [:]
     @Published private(set) var apps: [RunningAudioApp] = []
     @Published private(set) var inputs: [AudioInput] = []
@@ -396,6 +397,7 @@ final class RoutingWorkspace: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         savedGroups = SpeakerGroups(defaults: defaults)
+        bluetoothGroups = BluetoothGroups(defaults: defaults)
         let data = defaults.data(forKey: OutputVolumePreferences.key)
         volumePreferences = data.flatMap { try? JSONDecoder().decode(OutputVolumePreferences.self, from: $0) }
             ?? OutputVolumePreferences()
@@ -404,6 +406,9 @@ final class RoutingWorkspace: ObservableObject {
                 MainActor.assumeIsolated { self?.objectWillChange.send() }
             },
             savedGroups.objectWillChange.sink { [weak self] _ in
+                MainActor.assumeIsolated { self?.objectWillChange.send() }
+            },
+            bluetoothGroups.objectWillChange.sink { [weak self] _ in
                 MainActor.assumeIsolated { self?.objectWillChange.send() }
             },
             synchronizedGroup.$preparing.dropFirst().sink { [weak self] _ in
@@ -457,6 +462,7 @@ final class RoutingWorkspace: ObservableObject {
             destinations = available
             groupSelection.formIntersection(availableIDs)
         }
+        reconcileBluetoothGroups()
         lastAvailableActiveOutputs = Set(available.filter(hasRouteActivity).map(\.id))
     }
 
@@ -466,10 +472,17 @@ final class RoutingWorkspace: ObservableObject {
         if case .airplay(let id) = destination, let slot = airPlay.slots[id] {
             return !slot.claims.isEmpty || slot.connection != nil
         }
+        if case .bluetooth(let output) = destination, let uid = output.uid {
+            return bluetoothGroups.owners[uid] != nil
+        }
         return false
     }
 
     func setRouteVolume(_ volume: Double, route: OutputRoute) {
+        if case .bluetooth(let output) = route.destination, let uid = output.uid {
+            setBluetoothVolume(volume, for: uid)
+            return
+        }
         objectWillChange.send()
         route.volume = volume
         volumePreferences.levels[route.destination.visibilityKey] = volume
@@ -496,7 +509,7 @@ final class RoutingWorkspace: ObservableObject {
 
     var hasActiveRoutes: Bool {
         clock.isRunning || synchronizedGroup.preparing || synchronizedGroup.stream.active || savedGroups.hasActiveGroups ||
-            routes.values.contains { $0.starting || $0.stream.active }
+            !bluetoothGroups.active.isEmpty || routes.values.contains { $0.starting || $0.stream.active }
     }
 
     func stopAll() {
@@ -505,14 +518,16 @@ final class RoutingWorkspace: ObservableObject {
         for route in routes.values { route.stop() }
         synchronizedGroup.stop()
         savedGroups.stopAll()
+        bluetoothGroups.stopAll()
     }
 
     var isReconnecting: Bool {
-        airPlay.slots.keys.contains(where: isReconnecting(receiver:))
+        airPlay.slots.keys.contains(where: isReconnecting(receiver:)) ||
+            bluetoothGroups.statuses.values.contains(where: \.reconnecting)
     }
 
     var isConnecting: Bool { savedGroups.isConnecting || synchronizedGroup.isConnecting ||
-        routes.values.contains(where: \.isConnecting) }
+        routes.values.contains(where: \.isConnecting) || bluetoothGroups.statuses.values.contains(where: \.connecting) }
 
     func isReconnecting(group id: UUID) -> Bool {
         airPlay.slots.keys.contains { airPlay.requested($0, by: .saved(id)) && isReconnecting(receiver: $0) }
@@ -578,6 +593,8 @@ final class RoutingWorkspace: ObservableObject {
 
 @MainActor
 struct RoutingView: View {
+    private enum SourcePage { case airplay(UUID), bluetooth(UUID) }
+
     @ObservedObject var workspace: RoutingWorkspace
     @ObservedObject private var discovery: Discovery
     @ObservedObject private var synchronizedGroup: SynchronizedGroup
@@ -585,6 +602,7 @@ struct RoutingView: View {
     @AppStorage("room-audio.simple-mode") private var mainWindowSimpleMode = false
     @AppStorage("room-audio.pinned-outputs") private var pinnedOutputsData = Data()
     @State private var editingVisibility = false
+    @State private var sourcesPage: SourcePage?
     @State private var installingPTP = false
     @State private var setupError: String?
     @Environment(\.openWindow) private var openWindow
@@ -606,11 +624,12 @@ struct RoutingView: View {
     private var inputs: [AudioInput] { workspace.inputs }
     private var clock: SharedPTP { workspace.clock }
     private var simpleMode: Bool { menuBar || mainWindowSimpleMode }
+    private var hasGroups: Bool { !savedGroups.groups.isEmpty || !workspace.bluetoothGroups.groups.isEmpty }
 
     var body: some View {
         Group {
             if menuBar {
-                compactPanel.frame(width: 440)
+                compactPanel.frame(width: 420)
             } else if simpleMode {
                 compactPanel.frame(minWidth: 440, idealWidth: 600, maxWidth: .infinity,
                                    minHeight: 320, maxHeight: .infinity, alignment: .topLeading)
@@ -717,13 +736,13 @@ struct RoutingView: View {
             }
             List {
                 if editingVisibility { visibilitySettings }
-                if !simpleMode || !savedGroups.groups.isEmpty {
+                if !simpleMode || hasGroups {
                     SavedGroupsSection(workspace: workspace, groups: savedGroups, simpleMode: simpleMode)
                 }
                 let visible = destinations.filter(isVisible)
                 let availableIDs = Set(destinations.map(\.id))
                 let missing = knownDestinations.filter { !availableIDs.contains($0.id) && isVisible($0) }
-                if simpleMode && visible.isEmpty && missing.isEmpty && savedGroups.groups.isEmpty {
+                if simpleMode && visible.isEmpty && missing.isEmpty && !hasGroups {
                     Text("Choose which outputs to show in Output Visibility.")
                         .foregroundStyle(.secondary)
                 } else if !simpleMode && destinations.isEmpty {
@@ -748,6 +767,7 @@ struct RoutingView: View {
                 Button("Open Main Window") { RoomAudioDelegate.openMainWindow(openWindow) }
             } else {
                 Button("New Group…") { RoomAudioDelegate.openGroupWindow(openWindow, id: UUID()) }
+                Button("New Bluetooth Group…") { RoomAudioDelegate.openBluetoothGroupWindow(openWindow, id: UUID()) }
             }
             Button("Output Visibility") { editingVisibility = true }
             if !menuBar { Toggle("Simple Mode", isOn: $mainWindowSimpleMode) }
@@ -766,60 +786,98 @@ struct RoutingView: View {
     private var compactPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text(editingVisibility ? "Output Visibility" : "Room Audio").font(.headline)
-                Spacer()
-                if editingVisibility {
-                    Button("Done") { editingVisibility = false }
+                if sourcesPage != nil {
+                    Button {
+                        sourcesPage = nil
+                    } label: {
+                        Label("Room Audio", systemImage: "chevron.left").font(.headline)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Back to Room Audio")
+                    Spacer()
                 } else {
-                    panelMenu
+                    Text(editingVisibility ? "Output Visibility" : "Room Audio").font(.headline)
+                    Spacer()
+                    if editingVisibility {
+                        Button("Done") { editingVisibility = false }
+                    } else {
+                        panelMenu
+                    }
                 }
             }
-            if editingVisibility {
+            if let sourcesPage {
+                CompactPanelScroll(maximumHeight: 460, content: compactSources(sourcesPage))
+            } else if editingVisibility {
                 CompactPanelScroll(maximumHeight: 260, content: compactVisibilityOptions)
             } else {
                 CompactPanelScroll(maximumHeight: 460, content: compactRoutes)
             }
         }
-        .padding(16)
+        .padding(12)
+    }
+
+    @ViewBuilder private func compactSources(_ page: SourcePage) -> some View {
+        switch page {
+        case .airplay(let id):
+            if let group = savedGroups.groups.first(where: { $0.id == id }) {
+                CompactPanelSection("Sources for \(group.name)") {
+                    SavedGroupSources(groupID: id, workspace: workspace, groups: savedGroups)
+                }
+            } else {
+                Text("Group unavailable").foregroundStyle(.secondary)
+            }
+        case .bluetooth(let id):
+            if let group = workspace.bluetoothGroups.groups.first(where: { $0.id == id }) {
+                CompactPanelSection("Source for \(group.name)") {
+                    GroupSourceList(workspace: workspace, inputs: Binding(
+                        get: {
+                            workspace.bluetoothGroups.groups.first { $0.id == id }
+                                .map { [GroupInput(source: $0.source)] } ?? []
+                        },
+                        set: { if let input = $0.first { workspace.updateBluetoothGroupSource(input.source, in: id) } }
+                    ), allowsMultiple: false)
+                }
+            } else {
+                Text("Group unavailable").foregroundStyle(.secondary)
+            }
+        }
     }
 
     private var compactVisibilityOptions: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Always Show in Simple Mode")
-                .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+        CompactPanelSection("Always Show in Simple Mode") {
             visibilityOptions
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var compactRoutes: some View {
         let availableIDs = Set(destinations.map(\.id))
         let outputs = knownDestinations.filter(isVisible)
-        return VStack(alignment: .leading, spacing: 12) {
+        return VStack(alignment: .leading, spacing: 9) {
             if workspace.airPlay.runs[.quick] != nil {
                 Button("Stop Synchronized Group", action: workspace.stopQuickGroup)
             }
-            if !savedGroups.groups.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Groups").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            if hasGroups {
+                CompactPanelSection("Groups") {
                     ForEach(savedGroups.groups) { group in
                         if let session = savedGroups.session(for: group.id) {
                             SavedGroupRow(group: group, session: session, stream: session.stream,
                                           workspace: workspace, groups: savedGroups, simpleMode: true, compact: true,
-                                          allowsGroupEditing: !menuBar)
+                                          allowsGroupEditing: !menuBar, showSources: { sourcesPage = .airplay(group.id) })
                         }
+                    }
+                    ForEach(workspace.bluetoothGroups.groups) { group in
+                        BluetoothGroupRow(group: group, workspace: workspace, compact: true, allowsEditing: !menuBar,
+                                          showSources: { sourcesPage = .bluetooth(group.id) })
                     }
                 }
             }
             if !outputs.isEmpty {
-                if !savedGroups.groups.isEmpty { Divider() }
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Outputs").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                CompactPanelSection("Outputs") {
                     ForEach(outputs) { destination in
                         routeRow(destination, available: availableIDs.contains(destination.id), compact: true)
                     }
                 }
-            } else if savedGroups.groups.isEmpty {
+            } else if !hasGroups {
                 Text("Choose which outputs to show in Output Visibility.").foregroundStyle(.secondary)
             }
         }
@@ -875,6 +933,8 @@ struct RoutingView: View {
         ForEach(pinnable, id: \.visibilityKey) { destination in
             let names = if case .airplay(let id) = destination {
                 savedGroups.groups.filter { $0.members.contains(id) }.map(\.name)
+            } else if case .bluetooth(let output) = destination, let uid = output.uid {
+                workspace.bluetoothGroups.groups.filter { $0.outputs.contains { $0.uid == uid } }.map(\.name)
             } else { [String]() }
             Toggle(isOn: Binding(
                 get: { pinnedOutputs.contains(destination.visibilityKey) },
@@ -940,8 +1000,11 @@ struct RoutingView: View {
                      ))
         } else if compact {
             HStack(spacing: CompactRouteLayout.iconSpacing) {
-                CompactRouteLayout.icon(outputIcon)
-                Text("\(destination.name) · unavailable")
+                CompactRouteLayout.badge(outputIcon)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(destination.name)
+                    Text("Output unavailable").font(.caption).foregroundStyle(.secondary)
+                }
             }
             .foregroundStyle(.secondary)
         } else {
@@ -1330,13 +1393,15 @@ private struct RouteRow: View {
     @ObservedObject var group: SynchronizedGroup
     @ObservedObject var groupStream: Streaming
     let receiverID: Receiver.ID?
-    let workspace: RoutingWorkspace
+    @ObservedObject var workspace: RoutingWorkspace
     @ObservedObject var savedGroups: SpeakerGroups
     let compact: Bool
     @Binding var groupSelected: Bool
     @State private var sourceError: String?
     @State private var editingTVName = false
     @State private var tvName = ""
+    @State private var expanded = false
+    @State private var hovering = false
 
     var body: some View {
         Group {
@@ -1387,13 +1452,21 @@ private struct RouteRow: View {
     }
 
     private var compactRow: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(spacing: 8) {
-                volumeControl.disabled(!available)
-                transmissionControl
-                    .buttonStyle(CompactSpeakerButtonStyle())
-                    .frame(width: 28)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 12) {
+                CompactDisclosureButton(title: route.destination.name, symbol: outputIcon,
+                                        active: available && connected, subdued: !available,
+                                        connection: connecting ? ConnectionIcon(reconnecting: reconnecting) : nil,
+                                        showsArrow: hovering, expanded: $expanded)
+                HStack(spacing: 8) {
+                    volumeControl.disabled(!available)
+                    transmissionControl
+                        .buttonStyle(CompactSpeakerButtonStyle())
+                        .frame(width: 28)
+                }
             }
+            .background(.primary.opacity(hovering ? 0.06 : 0), in: RoundedRectangle(cornerRadius: 7))
+            .onHover { hovering = $0 }
             let status = compactStatus
             if blockedByTV || status != nil {
                 HStack(spacing: 6) {
@@ -1407,10 +1480,22 @@ private struct RouteRow: View {
                 .foregroundStyle(.secondary)
                 .padding(.leading, CompactRouteLayout.titleInset)
             }
+            if expanded {
+                CompactDetailPanel {
+                    if inGroup {
+                        LabeledContent("Source", value: groupSource)
+                    } else {
+                        RouteSourcePicker(title: route.starting || stream.active || individualRequested ? "Next Source" : "Source",
+                                          apps: apps, inputs: inputs, selection: $route.source)
+                        if case .application = route.source {
+                            Toggle("Also Play on This Mac", isOn: $route.playLocally).toggleStyle(.checkbox)
+                        }
+                    }
+                }
+                .padding(.leading, CompactRouteLayout.titleInset)
+            }
         }
         .padding(.vertical, 2)
-        .grayscale(available ? 0 : 1)
-        .opacity(available ? 1 : 0.55)
     }
 
     private var compactStatus: String? {
@@ -1418,17 +1503,28 @@ private struct RouteRow: View {
         return status == "Streaming off" ? nil : status
     }
 
+    private var groupSource: String {
+        if let bluetoothOwner { return bluetoothOwner.source.name }
+        if let activeSource = group.sourceName { return activeSource }
+        let route = outputSlot?.connection?.run.route
+        return route.flatMap(workspace.savedGroupForRoute)?.inputSummary ?? "Waiting for source"
+    }
+
     private var volumeControl: some View {
         VolumeSlider(name: route.destination.name,
                      value: Binding(get: { route.volume }, set: { workspace.setRouteVolume($0, route: route) }),
                      showsSignalColumn: !simpleMode, signal: normalizedSignal,
-                     caption: compact ? route.destination.name : nil,
-                     connection: compact && connecting ? ConnectionIcon(reconnecting: reconnecting) : nil,
-                     captionIcon: compact ? outputIcon : nil)
+                     hidesCaption: compact)
+    }
+
+    private var connected: Bool {
+        if case .connected = outputSlot?.state { return true }
+        return bluetoothState == .connected || stream.isTransmitting
     }
 
     private var connecting: Bool {
         if case .connecting = outputSlot?.state { return true }
+        if bluetoothState == .connecting || bluetoothState?.isRetrying == true { return true }
         return reconnecting || route.isConnecting
     }
 
@@ -1445,7 +1541,14 @@ private struct RouteRow: View {
     }
 
     @ViewBuilder private var transmissionControl: some View {
-        if inGroup {
+        if let owner = bluetoothOwner, case .bluetooth(let output) = route.destination, let uid = output.uid {
+            Button {
+                workspace.requestBluetoothOutput(uid, in: owner.id, enabled: false)
+            } label: {
+                transmissionLabel("Stop", active: true, compact: simpleMode)
+            }
+            .accessibilityLabel("Stop \(route.destination.name)")
+        } else if inGroup {
             let stopping = groupStream.receivers[route.destination.name] == "Stopping…" || groupStream.stopping
             Button {
                 if let receiverID { workspace.stopReceiver(receiverID) }
@@ -1482,9 +1585,20 @@ private struct RouteRow: View {
     }
 
     private var inGroup: Bool {
+        if bluetoothOwner != nil { return true }
         guard let route = outputSlot?.connection?.run.route else { return false }
         if case .individual = route { return false }
         return true
+    }
+
+    private var bluetoothOwner: BluetoothGroup? {
+        guard case .bluetooth(let output) = route.destination, let uid = output.uid else { return nil }
+        return workspace.bluetoothGroups.owner(of: uid)
+    }
+
+    private var bluetoothState: BluetoothMemberState? {
+        guard let owner = bluetoothOwner, case .bluetooth(let output) = route.destination, let uid = output.uid else { return nil }
+        return workspace.bluetoothGroups.statuses[owner.id]?.members[uid]
     }
 
     private var normalizedSignal: Double {
@@ -1523,6 +1637,10 @@ private struct RouteRow: View {
     private var activityLabel: String {
         if let sourceError { return sourceError }
         if !available { return "Output unavailable" }
+        if let owner = bluetoothOwner {
+            if let state = bluetoothState, state != .connected { return "\(owner.name) · \(state.description)" }
+            return owner.name
+        }
         if let slot = outputSlot {
             switch slot.availability {
             case .offline: return "Output unavailable"
@@ -1575,6 +1693,7 @@ private struct RouteRow: View {
                                         source: source, takeover: overrideTV ? receiverID : nil)
                 workspace.airPlay.reconcile(workspace)
             } else {
+                guard bluetoothOwner == nil else { return }
                 route.start(source, name: name, clock: clock, overrideTV: overrideTV)
             }
         } catch {
@@ -1639,15 +1758,102 @@ private struct CompactPanelScroll<Content: View>: View {
     }
 }
 
+private struct CompactPanelSection<Content: View>: View {
+    let title: String
+    let content: Content
+
+    init(_ title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 12, style: .continuous)
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .accessibilityAddTraits(.isHeader)
+            content
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.thinMaterial, in: shape)
+        .overlay { shape.strokeBorder(.primary.opacity(0.12)).allowsHitTesting(false) }
+    }
+}
+
+struct CompactDetailPanel<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) { content }
+            .font(.caption)
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+struct CompactDisclosureButton: View {
+    let title: String
+    let symbol: String
+    var active = false
+    var subdued = false
+    var emphasized = false
+    var connection: ConnectionIcon?
+    let showsArrow: Bool
+    @Binding var expanded: Bool
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        Button {
+            expanded.toggle()
+        } label: {
+            HStack(spacing: CompactRouteLayout.iconSpacing) {
+                CompactRouteLayout.badge(symbol, active: active)
+                Text(title)
+                    .font(emphasized ? .headline : .body)
+                    .foregroundStyle(subdued ? .secondary : .primary)
+                    .lineLimit(1)
+                if let connection { connection }
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 9)
+                    .opacity(showsArrow || focused || expanded ? 1 : 0)
+                    .accessibilityHidden(true)
+            }
+            .frame(width: CompactRouteLayout.captionWidth, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .focused($focused)
+        .accessibilityLabel("Details for \(title)")
+        .accessibilityValue(expanded ? "Expanded" : "Collapsed")
+        .help(title)
+    }
+}
+
 enum CompactRouteLayout {
-    static let captionWidth: CGFloat = 134
+    static let captionWidth: CGFloat = 140
     static let iconWidth: CGFloat = 18
-    static let iconSpacing: CGFloat = 6
-    static var titleInset: CGFloat { iconWidth + iconSpacing }
+    static let iconSpacing: CGFloat = 7
+    static let badgeSize: CGFloat = 24
+    static var titleInset: CGFloat { badgeSize + iconSpacing }
 
     static func icon(_ symbol: String) -> some View {
         Image(systemName: symbol)
             .frame(width: iconWidth)
+            .accessibilityHidden(true)
+    }
+
+    static func badge(_ symbol: String, active: Bool = false) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundStyle(active ? Color.white : Color.primary)
+            .frame(width: badgeSize, height: badgeSize)
+            .background(active ? Color.accentColor : Color.primary.opacity(0.12), in: Circle())
             .accessibilityHidden(true)
     }
 }
@@ -1658,13 +1864,10 @@ struct VolumeSlider: View {
     let showsSignalColumn: Bool
     var signal: Double? = nil
     var available = true
-    var caption: String? = nil
-    var connection: ConnectionIcon? = nil
-    var captionIcon: String? = nil
     var hidesCaption = false
 
     @ViewBuilder private var slider: some View {
-        if caption == nil && !hidesCaption {
+        if !hidesCaption {
             Slider(value: $value, in: 0...100, step: 1) { Text("Volume \(name)") }
         } else {
             Slider(value: Binding(get: { value }, set: { value = $0.rounded() }), in: 0...100) {
@@ -1675,17 +1878,7 @@ struct VolumeSlider: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            if hidesCaption {
-                EmptyView()
-            } else if let caption {
-                HStack(spacing: CompactRouteLayout.iconSpacing) {
-                    if let captionIcon { CompactRouteLayout.icon(captionIcon) }
-                    Text(caption).lineLimit(1).truncationMode(.tail)
-                    connection
-                }
-                    .frame(width: CompactRouteLayout.captionWidth, alignment: .leading)
-                    .help(caption)
-            } else {
+            if !hidesCaption {
                 Image(systemName: "speaker.wave.2")
                     .frame(width: 18, alignment: .leading)
                     .accessibilityHidden(true)

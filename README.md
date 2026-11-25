@@ -1,46 +1,57 @@
-# Room Audio 0.13.3
+# Room Audio
 
-Для сборки запусти `sh build.sh` на Mac с Apple Silicon, macOS 15 или новее и Command Line Tools для Xcode. Скрипт скачивает [cliairplay v0.5.17](https://github.com/music-assistant/airplay-cli/tree/v0.5.17) (GPL-3.0), проверяет SHA-256 и создаёт `Room Audio.app`. Можно указать путь к уже скачанному бинарнику через `ROOM_AUDIO_TRANSPORT`.
+Route audio from Mac apps and audio inputs to AirPlay speakers and Bluetooth devices. Send Chrome to the kitchen and a different app to the living room, or play the same mix across both rooms.
 
-Скрипт использует сертификат **Room Audio Local Signing**, если он есть в связке ключей, либо подписывает сборку ad hoc. Чтобы указать другой сертификат, передай его отпечаток в `ROOM_AUDIO_SIGNING_IDENTITY`. Подпись тем же сертификатом позволяет macOS узнавать приложение после обновления.
+<img src="docs/menu-bar.png" alt="Room Audio menu bar panel showing a synchronized AirPlay group and individual output controls" width="420">
 
-1. Открой `Room Audio.app`. Разреши доступ к локальной сети, если macOS запросит его.
-2. В строке каждого выхода выбери своё приложение или аудиоустройство. Например, **Kitchen → Spotify**, **Living Room → Chrome**.
-3. Для AirPlay открой полный режим, нажми **AirPlay без пароля…** и один раз подтверди установку службы PTP в окне macOS. Затем нажми **Запустить** в нужной строке. Все AirPlay-маршруты используют один таймер.
-4. В каждой строке есть собственные громкость, статус и индикатор сигнала. **Остановить** завершает только этот маршрут. PTP останавливается после последнего AirPlay-маршрута.
+*Menu bar panel with example devices.*
 
-По значку динамика в строке меню macOS открывается панель маршрутов. В простом режиме группы показаны сверху, а каждая видимая колонка занимает одну строку в нижнем списке. Нажатие на имя группы раскрывает её состав. У занятой колонки в составе есть действие **Забрать**, которое переключает её на эту группу. Из меню **…** можно открыть главное окно, настроить видимость, переключить режим, остановить все маршруты или выйти. Закрытие окна убирает Room Audio из Dock и Cmd+Tab. Значок в строке меню и активные маршруты остаются.
+## Features
 
-Создавай группу через **… → Новая группа…**. Нажатие на сводку источников открывает отдельное окно этой группы. В нём приложения и аудиоустройства показаны отдельными списками. Каждый вход можно добавить, удалить, приглушить или отрегулировать во время передачи. Настройки входов сохраняются в группе. Громкость группы регулирует выходы. Для приложения в меню строки входа доступно **Также на Mac**.
+- **Choose what each room hears.** Route a running app or a Core Audio input to an individual output. Virtual inputs such as BlackHole are optional.
+- **Save synchronized AirPlay groups.** Choose one or more receivers, mix multiple sources, and adjust each source’s level or mute it while streaming.
+- **Keep the speaker balance.** The group slider shows the loudest controlled output. Moving it scales the other levels proportionally, including when you turn the group down to zero and back up.
+- **Control playback from the menu bar.** Start, stop, and adjust outputs from the compact panel. Closing the main window keeps active streams running.
+- **Reconnect after interruptions.** Room Audio retries interrupted AirPlay routes and resumes active groups after the Mac wakes. Sources that return with the same app or audio device identity can rejoin an active mix.
 
-После пробуждения Mac или обрыва AirPlay Room Audio повторно подключает сохранённые группы, которые уже играли. Используются прежний источник и уровни колонок. Значок со стрелками появляется в строке меню и рядом с группой или колонкой во время первого подключения и при восстановлении. Ручная остановка отменяет восстановление. Сбой отдельного выхода не требует перезапуска остальных колонок.
+## Build from source
 
-Room Audio запоминает адрес и параметры каждой колонки AirPlay. На знакомой сети он сверяет идентификатор устройства по сохранённому адресу. Если проверка не проходит, он ищет колонку через Bonjour и продолжает сразу после получения ответа. При временном отказе на первом подключении передатчик один раз повторяет подключение с тем же PTP. Для Sonos One и Amp запас общего старта составляет 4,5 секунды, для других моделей — 6,5 секунды.
+Requires an Apple silicon Mac running macOS 15 or later and the Xcode Command Line Tools.
 
-Включи **Простой режим**, чтобы видеть сохранённые группы, активные и закреплённые колонки. В **Видимость выходов** отметь колонки, которые должны быть видны даже в паузе. Под именем колонки указаны её группы. Громкость и кнопки передачи остаются доступны. Для настройки источников вернись в полный режим. Режим и закреплённые колонки общие для окна и панели строки меню и сохраняются после перезапуска.
+```bash
+git clone https://github.com/karlovnv/Room-Audio.git
+cd Room-Audio
+sh build.sh
+open "Room Audio.app"
+```
 
-В разделе **Группы** нажми **+ Группа**, выбери имя и хотя бы две колонки AirPlay. Затем выбери один источник в строке группы. Состав и источник сохраняются после перезапуска. **Передавать** запускает свободные доступные колонки с общей меткой старта. Группа показывает число подключённых колонок и наличие сигнала от источника. Причина пропуска видна в строке колонки, а у каждой подключённой колонки указаны имя группы и текущий источник.
+The build downloads the pinned ARM64 version of `cliairplay`, verifies its SHA-256 checksum, and builds and signs `Room Audio.app` in the repository. To build with an existing copy of the same transport binary, set `ROOM_AUDIO_TRANSPORT` to its absolute path.
 
-Перед запуском маршрута Room Audio проверяет, свободна ли Sonos. Если она занята телевизором или другим AirPlay-потоком, Room Audio оставляет текущий звук и показывает причину, когда может её определить. Для других AirPlay-выходов проверяются маршруты самого Room Audio.
+The script uses the **Room Audio Local Signing** identity if available and falls back to ad hoc signing. Set `ROOM_AUDIO_SIGNING_IDENTITY` to use a specific identity. Reusing the same signing identity helps macOS recognize the app across rebuilds.
 
-После пропуска колонки, занятой телевизором, рядом с ней появляется молния **Force Play**. Рядом со статусом ТВ-входа карандаш позволяет сохранить имя подключённого устройства. Sonos сообщает, что занят ТВ-вход, а имя можно указать вручную. Нажатие молнии переключает колонку на Room Audio. Если группа уже играет, колонка присоединяется к её общей шкале времени, а остальные выходы продолжают играть. Другие источники, включая внешний AirPlay, сохраняют защиту от перехвата.
+## Get started
 
-Меняй громкость и останавливай отдельные колонки в их строках. Это не меняет сохранённый состав. Остановка группы завершает её оставшиеся маршруты. Чтобы вернуть отключённую колонку в синхронный поток, перезапусти группу.
+1. Allow local network access if macOS asks. For AirPlay, open the main window and choose **Set Up AirPlay Sync…** in the full view to install the synchronization service. macOS asks for administrator approval during setup.
+2. Choose a **Source** in an output row and click **Start**. macOS may ask for system audio recording or microphone access, depending on the source.
+3. To create a saved group, open **… → New Group…** in the main window, give it a name, and select its AirPlay outputs. Click the source summary to open its mixer inside the compact panel or from the main window. The checkboxes apply immediately, including when you clear the last source. An active group stays connected and sends silence until a source provides audio.
+4. Use **… → Output Visibility** to pin outputs in the menu bar panel. The **Simple Mode** setting changes the layout of the main window.
 
-Слайдер группы показывает громкость самой громкой колонки, доступной для управления. При его изменении уровни остальных колонок меняются пропорционально. Если у двух колонок 30% и 60%, установка 40% даст 20% и 40%. Уровни каждой колонки и баланс группы при 0% сохраняются после перезапуска. При переходе через 0% передача продолжается.
+Use **Also Play on This Mac** to keep an app audible locally. In a group mixer, this action is in the source row’s context menu.
 
-В режиме **Приложение** выбери один запущенный источник. Если Room Audio просит сначала запустить звук, начни воспроизведение в приложении и повтори запуск. macOS при первом захвате может запросить разрешение на запись системного аудио. Переключатель **Также играть на Mac** оставляет локальное воспроизведение выбранного приложения. Браузер выбирается целиком, включая его уже работающие аудиопроцессы. После перезапуска источника останови передачу и выбери приложение заново.
+Connect Bluetooth outputs in macOS Bluetooth settings first. In the main window, choose **… → New Bluetooth Group…**, select one source, and choose the Bluetooth outputs. Expand the group in the main window to set each device’s volume, stereo balance, and additional delay (0–1000 ms). macOS and each device negotiate their Bluetooth codec.
 
-В режиме **Аудиоустройство** BlackHole 2ch остаётся доступен. Направь в него звук через настройки источника или выбери его в **Системные настройки → Звук → Выход**. Room Audio сам системный выход не переключает.
+## How routing works
 
-Для одного источника на нескольких AirPlay-выходах выбери этот источник в каждой нужной строке, отметь **В группу** и нажми **Запустить синхронно**. Room Audio открывает один захват и задаёт одну метку старта всем выходам. Кнопка **Остановить** в строке отключает только эту колонку. **Остановить группу** завершает все оставшиеся маршруты группы. Раздельные кнопки **Запустить** по-прежнему создают независимые маршруты.
+An AirPlay output can belong to several saved groups and play one route at a time. When an active group is waiting for an output, it can pick up that output as soon as it becomes free. **Take Over** moves the output to the selected group. **Connect** restores an output you stopped manually within a group.
 
-В меню источников иконка **динамика** означает, что аудиовыход приложения открыт. Иконка **динамика с волнами** появляется, когда Room Audio обнаруживает звуковой сигнал. Проверка сигнала работает, пока открыто меню выбора источника. macOS может попросить разрешение на запись системного аудио. Во время передачи можно просматривать источники и выбрать следующий. Текущий источник указан рядом со статусом.
+Room Audio checks whether a Sonos output is already in use. If a TV input is active, the lightning button (**Force Play**) lets you switch that output to Room Audio. Other receivers in the group can continue playing.
 
-Для Bluetooth сначала подключи устройство в настройках macOS, затем выбери его в разделе **Bluetooth**. Room Audio регулирует уровень своего сигнала отдельно от системной громкости. Bluetooth работает напрямую через Core Audio. Совместный вывод Bluetooth и AirPlay требует отдельной проверки.
+## Current limits
 
-Захват рассчитан на стерео 44,1 или 48 кГц Float32. Буферизация AirPlay добавляет задержку. Ручная коррекция задержки и инверсия полярности запланированы отдельным этапом.
+- App capture works at the app level. A browser source includes its audio across tabs.
+- AirPlay groups synchronize their receivers. Bluetooth groups use independent device streams and manual delay adjustment. Bluetooth and AirPlay outputs are grouped separately. Screen mirroring synchronization is outside the current scope.
+- Chromecast output, manual AirPlay delay adjustment, and polarity inversion are outside the current scope.
 
-Для проверки обнаружения запусти `./Room\ Audio.app/Contents/MacOS/RoomAudio --verify-discovery`. Служба PTP устанавливается отдельно по кнопке **AirPlay без пароля…** с подтверждением администратора.
+## Credits
 
-Один AirPlay-выход может входить в несколько групп. Пока выход занят, запросы активных маршрутов ждут своей очереди. **Забрать** временно меняет владельца. После остановки нового владельца выход возвращается к первому ожидающему маршруту. Ручной стоп колонки отзывает её запрос, а **Подключить** возвращает его. Вход микшера с прежним bundle ID или UID Core Audio восстанавливается в работающей группе со своим уровнем и приглушением.
+Room Audio uses `cliairplay` from Music Assistant for AirPlay transport. See the [pinned v0.5.17 release](https://github.com/music-assistant/airplay-cli/releases/tag/v0.5.17) and the [transport’s GPL-3.0 license](https://github.com/music-assistant/airplay-cli/blob/v0.5.17/LICENSE).

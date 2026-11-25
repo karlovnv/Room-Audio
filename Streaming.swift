@@ -27,6 +27,7 @@ final class Capture {
     private let id: AudioObjectID
     private let fd: Int32?
     private let localOutput: LocalPlayback?
+    private let fanout: LocalPlaybackFanout?
     private let mixInput: MixInputBuffer?
     private let pcm: UnsafeMutablePointer<Int16>
     private var callback: AudioDeviceIOProcID?
@@ -35,10 +36,12 @@ final class Capture {
     let sampleRate: Int
 
     init(id: AudioObjectID, fd: Int32?, tapFormat: AudioStreamBasicDescription? = nil,
-         localOutput: LocalPlayback? = nil, mixInput: MixInputBuffer? = nil) throws {
+         localOutput: LocalPlayback? = nil, mixInput: MixInputBuffer? = nil,
+         fanout: LocalPlaybackFanout? = nil) throws {
         self.id = id
         self.fd = fd
         self.localOutput = localOutput
+        self.fanout = fanout
         self.mixInput = mixInput
         var property = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamFormat,
                                                   mScope: kAudioObjectPropertyScopeInput,
@@ -48,13 +51,14 @@ final class Capture {
             var size = UInt32(MemoryLayout.size(ofValue: format))
             try Self.check(AudioObjectGetPropertyData(id, &property, 0, nil, &size, &format))
         }
-        let supported = mixInput == nil
-            ? [44100.0, 48000.0].contains(format.mSampleRate) && format.mChannelsPerFrame == 2
-            : (8000...192000).contains(format.mSampleRate) && (1...2).contains(format.mChannelsPerFrame)
+        let flexibleInput = mixInput != nil || fanout != nil
+        let supported = flexibleInput
+            ? (8000...192000).contains(format.mSampleRate) && (1...2).contains(format.mChannelsPerFrame)
+            : [44100.0, 48000.0].contains(format.mSampleRate) && format.mChannelsPerFrame == 2
         guard supported,
               format.mFormatID == kAudioFormatLinearPCM, format.mBitsPerChannel == 32,
               format.mFormatFlags & kAudioFormatFlagIsFloat != 0 else {
-            throw StreamError(mixInput == nil ? "A 44.1 or 48 kHz Float32 stereo input is required." : "Unsupported audio input format.")
+            throw StreamError(flexibleInput ? "Unsupported audio input format." : "A 44.1 or 48 kHz Float32 stereo input is required.")
         }
         sampleRate = Int(format.mSampleRate)
         if let fd {
@@ -89,7 +93,7 @@ final class Capture {
             mixInput.enqueue(first, right: right, frames: count, channels: right == nil ? channels : 1)
             return
         }
-        guard right != nil || channels == 2 else { return }
+        guard right != nil || channels == 2 || (fanout != nil && channels == 1) else { return }
         var offset = 0
         var maximum: Float = 0
         while offset < count {
@@ -100,7 +104,7 @@ final class Capture {
                 for channel in 0..<2 {
                     let sample: Float
                     if let right { sample = channel == 0 ? first[frame] : right[frame] }
-                    else { sample = first[2 * frame + channel] }
+                    else { sample = first[frame * channels + min(channel, channels - 1)] }
                     let limited = sample.isFinite ? max(-1, min(1, sample)) : 0
                     maximum = max(maximum, abs(limited))
                     pcm[2 * index + channel] = Int16((limited * 32767).rounded())
@@ -115,6 +119,7 @@ final class Capture {
                 failed.store(true, ordering: .relaxed)
                 return
             }
+            fanout?.enqueue(pcm, frames: length)
             offset += length
         }
         var previous = peak.load(ordering: .relaxed)
@@ -133,14 +138,15 @@ final class Capture {
 extension Capture {
     @MainActor
     static func make(_ source: AudioSource, fd: Int32?, localOutput: LocalPlayback? = nil,
-                     mixInput: MixInputBuffer? = nil) throws -> (Capture, AppAudioTap?) {
+                     mixInput: MixInputBuffer? = nil,
+                     fanout: LocalPlaybackFanout? = nil) throws -> (Capture, AppAudioTap?) {
         switch source {
         case .device(let id):
-            return (try Capture(id: id, fd: fd, localOutput: localOutput, mixInput: mixInput), nil)
+            return (try Capture(id: id, fd: fd, localOutput: localOutput, mixInput: mixInput, fanout: fanout), nil)
         case .application(let ids, let playLocally):
             let tap = try AppAudioTap(processes: ids, playLocally: playLocally)
             return (try Capture(id: tap.device, fd: fd, tapFormat: tap.format,
-                                localOutput: localOutput, mixInput: mixInput), tap)
+                                localOutput: localOutput, mixInput: mixInput, fanout: fanout), tap)
         case .mix:
             throw StreamError("The mixer is available for saved groups.")
         }

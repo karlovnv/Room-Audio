@@ -116,13 +116,9 @@ struct GroupSourcesWindow: View {
                     .font(.title2.weight(.semibold))
                     .padding([.top, .horizontal], 18)
                 ScrollView {
-                    let stream = groups.session(for: groupID)?.stream
-                    GroupSourceList(workspace: workspace, inputs: Binding(
-                        get: { self.group?.configuredInputs ?? [] },
-                        set: { workspace.updateGroupInputs($0, in: groupID) }
-                    ), statuses: stream?.mixStatus ?? [:], running: stream?.active == true)
-                    .padding(18)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    SavedGroupSources(groupID: groupID, workspace: workspace, groups: groups)
+                        .padding(18)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             } else {
                 Text("Group unavailable")
@@ -143,11 +139,27 @@ struct GroupSourcesWindow: View {
 }
 
 @MainActor
-private struct GroupSourceList: View {
+struct SavedGroupSources: View {
+    let groupID: UUID
+    @ObservedObject var workspace: RoutingWorkspace
+    @ObservedObject var groups: SpeakerGroups
+
+    var body: some View {
+        let stream = groups.session(for: groupID)?.stream
+        GroupSourceList(workspace: workspace, inputs: Binding(
+            get: { groups.groups.first { $0.id == groupID }?.configuredInputs ?? [] },
+            set: { workspace.updateGroupInputs($0, in: groupID) }
+        ), statuses: stream?.mixStatus ?? [:], running: stream?.active == true)
+    }
+}
+
+@MainActor
+struct GroupSourceList: View {
     @ObservedObject var workspace: RoutingWorkspace
     @Binding var inputs: [GroupInput]
     var statuses: [String: MixInputStatus] = [:]
     var running = false
+    var allowsMultiple = true
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -176,9 +188,32 @@ private struct GroupSourceList: View {
                 Text("No sources available").font(.caption).foregroundStyle(.secondary)
             }
             ForEach(sources) { source in
-                inputRow(source, input: inputs.first { $0.id == source.id })
+                let input = inputs.first { $0.id == source.id }
+                if allowsMultiple {
+                    inputRow(source, input: input)
+                } else {
+                    singleSourceRow(source, selected: input != nil)
+                }
             }
         }
+    }
+
+    private func singleSourceRow(_ source: SavedGroupSource, selected: Bool) -> some View {
+        Button {
+            if !selected { inputs = [GroupInput(source: source)] }
+        } label: {
+            HStack(spacing: 7) {
+                SourceIdentityIcon(source: source, workspace: workspace)
+                Text(source.name).lineLimit(1)
+                Spacer()
+                if selected { Image(systemName: "checkmark").foregroundStyle(Color.accentColor) }
+            }
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .help(source.name)
     }
 
     private func inputRow(_ source: SavedGroupSource, input: GroupInput?) -> some View {

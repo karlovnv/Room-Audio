@@ -72,10 +72,10 @@ struct SpeakerGroup: Identifiable, Codable, Equatable {
     }
 }
 
-struct GroupVolumeBalance: Codable {
-    private var levelsBeforeZero: [Receiver.ID: Double] = [:]
+struct GroupVolumeBalance<OutputID: Hashable & Codable>: Codable {
+    private var levelsBeforeZero: [OutputID: Double] = [:]
 
-    mutating func resized(_ levels: [Receiver.ID: Double], maximum: Double) -> [Receiver.ID: Double] {
+    mutating func resized(_ levels: [OutputID: Double], maximum: Double) -> [OutputID: Double] {
         let previousMaximum = levels.values.max() ?? 0
         if previousMaximum > 0 {
             if maximum == 0 { levelsBeforeZero = levels }
@@ -94,7 +94,8 @@ struct GroupVolumeBalance: Codable {
 struct OutputVolumePreferences: Codable {
     static let key = "room-audio.output-volume-preferences"
     var levels: [String: Double] = [:]
-    var groupBalances: [String: GroupVolumeBalance] = [:]
+    var groupBalances: [String: GroupVolumeBalance<Receiver.ID>] = [:]
+    var bluetoothGroupBalances: [String: GroupVolumeBalance<String>]?
 }
 
 @MainActor
@@ -289,7 +290,7 @@ func verifySavedGroups() {
               session.reason(for: "Kitchen") == "In use by: Telegram",
               session.reason(for: "Offline") == "Output unavailable" else { return false }
         print("GROUP_PARTIAL_START_SKIPS_BUSY_AND_OFFLINE")
-        var balance = GroupVolumeBalance()
+        var balance = GroupVolumeBalance<Receiver.ID>()
         let original: [Receiver.ID: Double] = [k: 30, l: 60, missing: 0]
         let reduced = balance.resized(original, maximum: 40)
         let zero = balance.resized(reduced, maximum: 0)
@@ -362,6 +363,9 @@ struct SavedGroupsSection: View {
                                   workspace: workspace, groups: groups, simpleMode: simpleMode)
                 }
             }
+            ForEach(workspace.bluetoothGroups.groups) { group in
+                BluetoothGroupRow(group: group, workspace: workspace, compact: false, allowsEditing: true)
+            }
         }
     }
 }
@@ -376,8 +380,10 @@ struct SavedGroupRow: View {
     let simpleMode: Bool
     var compact = false
     var allowsGroupEditing = true
+    var showSources: (() -> Void)?
     @Environment(\.openWindow) private var openWindow
     @State private var expanded = false
+    @State private var hovering = false
 
     private var active: Bool { workspace.airPlay.runs[.saved(group.id)] != nil }
     private var recovering: Bool { workspace.isReconnecting(group: group.id) }
@@ -387,7 +393,10 @@ struct SavedGroupRow: View {
             if compact {
                 compactHeader
                 compactSummary
-                if expanded { compactMembers }
+                if expanded {
+                    CompactDetailPanel { compactMembers }
+                        .padding(.leading, CompactRouteLayout.titleInset)
+                }
             } else {
                 header
                 sourcesLink
@@ -405,7 +414,8 @@ struct SavedGroupRow: View {
 
     private var sourcesLink: some View {
         Button(group.configuredInputs.isEmpty ? "Choose Sources…" : group.inputSummary) {
-            RoomAudioDelegate.openSourcesWindow(openWindow, id: group.id)
+            if let showSources { showSources() }
+            else { RoomAudioDelegate.openSourcesWindow(openWindow, id: group.id) }
         }
         .buttonStyle(TextActionStyle(linkColor: true))
         .accessibilityLabel("Sources for \(group.name)")
@@ -418,24 +428,10 @@ struct SavedGroupRow: View {
 
     private var compactHeader: some View {
         HStack(spacing: 12) {
-            Button {
-                expanded.toggle()
-            } label: {
-                HStack(spacing: CompactRouteLayout.iconSpacing) {
-                    CompactRouteLayout.icon("hifispeaker.2")
-                    Text(group.name).lineLimit(1)
-                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                        .font(.caption2).foregroundStyle(.secondary).accessibilityHidden(true)
-                    if workspace.isReconnecting(group: group.id) || session.isConnecting {
-                        ConnectionIcon(reconnecting: workspace.isReconnecting(group: group.id))
-                    }
-                }
-                .font(.headline)
-            }
-            .buttonStyle(TextActionStyle())
-            .accessibilityValue(expanded ? "Outputs expanded" : "Outputs collapsed")
-            .help(expanded ? "Hide group outputs" : "Show group outputs")
-            .frame(width: CompactRouteLayout.captionWidth, alignment: .leading)
+            CompactDisclosureButton(title: group.name, symbol: "hifispeaker.2", active: !connected.isEmpty,
+                                    emphasized: true, connection: recovering || session.isConnecting
+                                        ? ConnectionIcon(reconnecting: recovering) : nil,
+                                    showsArrow: hovering, expanded: $expanded)
             HStack(spacing: 8) {
                 volumeControl.opacity(active || recovering ? 1 : 0)
                     .disabled(!active && !recovering)
@@ -443,6 +439,8 @@ struct SavedGroupRow: View {
                 transmissionControl.frame(width: 28)
             }
         }
+        .background(.primary.opacity(hovering ? 0.06 : 0), in: RoundedRectangle(cornerRadius: 7))
+        .onHover { hovering = $0 }
     }
 
     private var compactSummary: some View {
@@ -519,7 +517,7 @@ struct SavedGroupRow: View {
             }
         }
         .font(.caption)
-        .padding(.leading, CompactRouteLayout.titleInset)
+        .padding(.leading, compact ? 0 : CompactRouteLayout.titleInset)
     }
 
     private var volumeControl: some View {
@@ -709,6 +707,7 @@ extension RoutingWorkspace {
     func prepareSavedGroupsForSleep() {
         guard !waitingForWake else { return }
         waitingForWake = true
+        reconcileBluetoothGroups()
         airPlay.reconcile(self)
     }
 

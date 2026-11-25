@@ -1,3 +1,4 @@
+import AppKit
 import CoreAudio
 import SwiftUI
 
@@ -9,6 +10,8 @@ struct RouteSourcePicker: View {
     @Binding var selection: RouteSourceChoice?
     var unavailableName: String? = nil
     var compact = false
+    var allowsClearing = true
+    var showsSourceIcons = false
     @State private var showing = false
 
     var body: some View {
@@ -38,7 +41,8 @@ struct RouteSourcePicker: View {
         .accessibilityLabel(title)
         .accessibilityValue(selectedName)
         .popover(isPresented: $showing, arrowEdge: .bottom) {
-            SourceChoices(inputs: inputs, selection: $selection) { showing = false }
+            SourceChoices(inputs: inputs, selection: $selection, allowsClearing: allowsClearing,
+                          showsSourceIcons: showsSourceIcons) { showing = false }
         }
     }
 
@@ -138,6 +142,8 @@ func verifyAppSignals(feeder: String, file: String) async {
 private struct SourceChoices: View {
     let inputs: [AudioInput]
     @Binding var selection: RouteSourceChoice?
+    let allowsClearing: Bool
+    let showsSourceIcons: Bool
     let close: () -> Void
     @State private var apps: [RunningAudioApp] = []
     @State private var playing: Set<pid_t> = []
@@ -146,17 +152,18 @@ private struct SourceChoices: View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 2) {
-                    choice("Choose", nil)
+                    if allowsClearing { choice("Choose", nil) }
                     section("Apps")
                     ForEach(apps) { app in
                         let signal = playing.contains(app.id)
-                        choice(app.name, .application(app.id),
+                        choice(app.name, .application(app.id), sourceSymbol: "app",
+                               appIcon: showsSourceIcons ? NSRunningApplication(processIdentifier: app.id)?.icon : nil,
                                icon: signal ? "speaker.wave.2.fill" : app.hasActiveOutput ? "speaker.fill" : nil,
                                signal: signal,
                                value: signal ? "Playing audio" : app.hasActiveOutput ? "Audio output open" : "")
                     }
                     section("Audio Devices")
-                    ForEach(inputs) { input in choice(input.name, .device(input.id)) }
+                    ForEach(inputs) { input in choice(input.name, .device(input.id), sourceSymbol: input.symbol) }
                 }
                 .padding(10)
             }
@@ -180,7 +187,8 @@ private struct SourceChoices: View {
             .accessibilityAddTraits(.isHeader)
     }
 
-    private func choice(_ title: String, _ source: RouteSourceChoice?, icon: String? = nil,
+    private func choice(_ title: String, _ source: RouteSourceChoice?, sourceSymbol: String? = nil,
+                        appIcon: NSImage? = nil, icon: String? = nil,
                         signal: Bool = false, value: String = "") -> some View {
         Button {
             selection = source
@@ -189,6 +197,14 @@ private struct SourceChoices: View {
             HStack(spacing: 7) {
                 Image(systemName: "checkmark")
                     .opacity(selection == source ? 1 : 0).frame(width: 16)
+                if showsSourceIcons, let sourceSymbol {
+                    Group {
+                        if let appIcon { Image(nsImage: appIcon).resizable().scaledToFit() }
+                        else { Image(systemName: sourceSymbol) }
+                    }
+                    .frame(width: 18, height: 18)
+                    .accessibilityHidden(true)
+                }
                 Text(title).lineLimit(1)
                 Spacer()
                 if let icon {

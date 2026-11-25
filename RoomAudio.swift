@@ -659,7 +659,8 @@ final class RoomAudioDelegate: NSObject, NSApplicationDelegate {
     }
 
     private static func isRoomAudioWindow(_ window: NSWindow) -> Bool {
-        window.styleMask.contains(.titled) && ["Room Audio", "Room Audio Group", "Room Audio Sources"].contains(window.title)
+        window.styleMask.contains(.titled) &&
+            ["Room Audio", "Room Audio Group", "Room Audio Sources", "Room Audio Bluetooth Group"].contains(window.title)
     }
 
     static func openMainWindow(_ openWindow: OpenWindowAction) {
@@ -677,6 +678,12 @@ final class RoomAudioDelegate: NSObject, NSApplicationDelegate {
     static func openSourcesWindow(_ openWindow: OpenWindowAction, id: UUID) {
         NSApp.setActivationPolicy(.regular)
         openWindow(id: "group-sources", value: id)
+        NSApp.activate()
+    }
+
+    static func openBluetoothGroupWindow(_ openWindow: OpenWindowAction, id: UUID) {
+        NSApp.setActivationPolicy(.regular)
+        openWindow(id: "bluetooth-group", value: id)
         NSApp.activate()
     }
 
@@ -730,6 +737,14 @@ struct RoomAudioApp: App {
             }
         }
         .defaultSize(width: 530, height: 440)
+        .restorationBehavior(.disabled)
+
+        WindowGroup("Room Audio Bluetooth Group", id: "bluetooth-group", for: UUID.self) { $groupID in
+            if let groupID {
+                BluetoothGroupEditor(id: groupID, workspace: workspace)
+            }
+        }
+        .defaultSize(width: 490, height: 360)
         .restorationBehavior(.disabled)
 
         MenuBarExtra {

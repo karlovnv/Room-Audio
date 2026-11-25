@@ -25,6 +25,8 @@ PINNED_SHA256 = 'de19cc204837640301061a088459ed72e2aa10a352c9040f9e26f9dbb10f7c3
 ENDPOINT_CACHE = Path.home() / 'Library' / 'Caches' / 'local.roomaudio.discovery' / 'airplay-endpoints'
 START_LEAD_MS = 6500
 SONOS_START_LEAD_MS = 4500
+LATE_JOIN_LEAD_MS = 5500
+LATE_JOIN_BUFFER_LEAD_MS = 1000
 CONNECT_RETRY_DELAY = .75
 CONNECT_RETRY_WINDOW = 4
 stop_requested = False
@@ -244,7 +246,8 @@ def open_session(binary, endpoint, address, rate, volume, folder, label):
 def join_position(anchor, sample_rate, received_bytes, now_ms):
     # The next receiver must queue the same source frame that the existing
     # receivers will render at its scheduled start.
-    first_frame = max(math.ceil(received_bytes / 4), math.ceil((now_ms + 5500 - anchor) * sample_rate / 1000))
+    first_frame = max(math.ceil(received_bytes / 4),
+                      math.ceil((now_ms + LATE_JOIN_LEAD_MS - anchor) * sample_rate / 1000))
     return first_frame * 4, anchor + round(first_frame * 1000 / sample_rate)
 
 
@@ -645,7 +648,15 @@ def main(args):
                             (ack and int(ack[1]) != late.get('start'))):
                             retire(name, 'Could not join synchronized playback')
                             continue
-                        if 'start' in late and '[STATUS] audio buffered_ms=' in statuses and not late.get('sent'):
+                        if ready and 'offset' in late and not late.get('prebuffering'):
+                            now_ms = int(time.time() * 1000)
+                            if late['start'] < now_ms + LATE_JOIN_BUFFER_LEAD_MS:
+                                # Nothing was sent while waiting for PTP. Pick a fresh
+                                # frame and its matching anchor before feeding the receiver.
+                                late['offset'], late['start'] = join_position(anchor, args.sample_rate, received, now_ms)
+                                s['queue'].clear()
+                            late['prebuffering'] = True
+                        if ready and late.get('prebuffering') and '[STATUS] audio buffered_ms=' in statuses and not late.get('sent'):
                             try:
                                 command(s, f'TITLE=Room Audio\nSTART_JOIN=1\nSTART_UNIX_MS={late["start"]}\nACTION=START\n')
                             except OSError:
@@ -688,7 +699,9 @@ def main(args):
                         raise RuntimeError('The AirPlay devices confirmed different start times')
                 if deadline is not None and time.monotonic() >= deadline:
                     raise RuntimeError('Timed out starting AirPlay')
-                read, writes, _ = select.select([0], [s['fd'] for s in sessions.values() if s['queue']], [], .08)
+                write_fds = [s['fd'] for s in sessions.values() if s['queue']
+                             and (not s.get('late') or s['late'].get('prebuffering'))]
+                read, writes, _ = select.select([0], write_fds, [], .08)
                 if read:
                     chunk = os.read(0, 16384)
                     if not chunk:
@@ -702,7 +715,13 @@ def main(args):
                         else:
                             s['queue'].extend(chunk)
                         if len(s['queue']) > args.sample_rate * 4 * 6:
-                            if late or s.get('joined'):
+                            if late and not late.get('prebuffering'):
+                                # A long clock wait can outlive the staged audio. Catch up
+                                # to the live input without overflowing the receiver queue.
+                                late['offset'], late['start'] = join_position(
+                                    anchor, args.sample_rate, received + len(chunk), int(time.time() * 1000))
+                                s['queue'].clear()
+                            elif late or s.get('joined'):
                                 retire(name, 'The audio queue overflowed')
                             else:
                                 fail_receiver(name, 'The audio queue overflowed')
