@@ -34,6 +34,11 @@ class Stop(Exception):
     pass
 
 
+class LocalAirPlayReceiver(RuntimeError):
+    def __init__(self):
+        super().__init__('Это текущий Mac. Для звука приложения на нём включи «Также на Mac».')
+
+
 def clock_exists():
     libc = ctypes.CDLL(None, use_errno=True)
     fd = libc.shm_open(b'/cliairplay-ptp', os.O_RDONLY)
@@ -121,9 +126,19 @@ def route_context(host):
     interface = re.search(r'^\s*interface:\s+(\S+)', route, re.M)
     if not interface:
         raise RuntimeError('Сетевой интерфейс для AirPlay не найден')
+    if interface[1] == 'lo0':
+        raise LocalAirPlayReceiver()
     address = subprocess.check_output(['/usr/sbin/ipconfig', 'getifaddr', interface[1]], text=True).strip()
     gateway = re.search(r'^\s*gateway:\s+(\S+)', route, re.M)
     return [interface[1], address, gateway[1] if gateway else None]
+
+
+def receiver_route(name):
+    try:
+        endpoint = resolve(name)
+        return name, endpoint, route_context(endpoint[0])
+    except LocalAirPlayReceiver as error:
+        return name, None, str(error)
 
 
 def resolve(name):
@@ -323,17 +338,17 @@ def main(args):
         return
     names = args.receivers
     with ThreadPoolExecutor(max_workers=min(8, len(names))) as resolvers:
-        endpoints = dict(zip(names, resolvers.map(resolve, names)))
-    interfaces = set()
-    for host, _, _ in endpoints.values():
-        route = subprocess.check_output(['/sbin/route', '-n', 'get', host], text=True)
-        interface = re.search(r'^\s*interface:\s+(\S+)', route, re.M)
-        if not interface:
-            raise RuntimeError('Сетевой интерфейс для AirPlay не найден')
-        interfaces.add(interface[1])
-    if len(interfaces) != 1:
+        routes = list(resolvers.map(receiver_route, names))
+    endpoints = {name: endpoint for name, endpoint, _ in routes if endpoint is not None}
+    networks = {(route[0], route[1]) for _, endpoint, route in routes if endpoint is not None}
+    for name, endpoint, route in routes:
+        if endpoint is None and not args.clock_only:
+            publish('receiver_skipped', receiver=name, message=route, category='local')
+    if not endpoints:
+        raise LocalAirPlayReceiver()
+    if len(networks) != 1:
         raise RuntimeError('AirPlay-устройства доступны через разные интерфейсы')
-    address = subprocess.check_output(['/usr/sbin/ipconfig', 'getifaddr', interfaces.pop()], text=True).strip()
+    _, address = networks.pop()
     if args.use_shared_clock:
         if args.clock_address != address:
             raise RuntimeError('Выход доступен через другой сетевой интерфейс PTP')
@@ -405,6 +420,16 @@ def main(args):
             probes = {}
             pending_connects = {}
             retried = set()
+            next_join = 0
+
+            def probe_receiver(name, endpoint):
+                if endpoint is None:
+                    endpoint = resolve(name)
+                    if route_context(endpoint[0])[1] != address:
+                        raise RuntimeError('Выход доступен через другой сетевой интерфейс PTP')
+                host, _, txt = endpoint
+                block = check_sonos(host) if args.protect_sonos and 'manufacturer=sonos' in txt.casefold().split() else None
+                return endpoint, block
 
             def retire(name, failure=None):
                 session = sessions.pop(name)
@@ -491,13 +516,14 @@ def main(args):
                         for name, token in requests.items():
                             if token in seen_joins:
                                 continue
-                            if name in retiring:
+                            if name in retiring or name in probes:
                                 continue
                             seen_joins.add(token)
+                            transfer = token.startswith('transfer:')
                             recovering = token.startswith('recover:')
-                            eligible = failed_receivers if recovering else tv_skips
-                            if name in eligible and name in new_volumes and name not in sessions:
-                                probes[name] = (joining.submit(check_sonos, endpoints[name][0]), recovering)
+                            eligible = transfer or name in (failed_receivers if recovering else tv_skips)
+                            if eligible and name in new_volumes and name not in sessions:
+                                probes[name] = (joining.submit(probe_receiver, name, endpoints.get(name)), recovering or transfer)
                             else:
                                 publish('receiver_skipped', receiver=name, message='недоступна для подключения', category='unknown')
                     for name, (future, recovering) in list(probes.items()):
@@ -506,7 +532,17 @@ def main(args):
                         del probes[name]
                         if name not in new_volumes:
                             continue
-                        block = future.result()
+                        try:
+                            endpoint, block = future.result()
+                        except LocalAirPlayReceiver as error:
+                            publish('receiver_skipped', receiver=name, message=str(error), category='local')
+                            continue
+                        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                            failed_receivers.add(name)
+                            publish('receiver_failed', receiver=name, message='не удалось найти выход AirPlay',
+                                    diagnostic=str(error))
+                            continue
+                        endpoints[name] = endpoint
                         if block and (recovering or block[0] != 'tv'):
                             if recovering and block[0] != 'tv':
                                 publish('receiver_failed', receiver=name, message=block[1])
@@ -519,10 +555,12 @@ def main(args):
                                 publish('receiver_skipped', receiver=name, message=block[1], category=block[0])
                             continue
                         try:
-                            fresh = open_session(binary, endpoints[name], address, args.sample_rate,
-                                                 new_volumes[name], folder, f'join-{len(seen_joins)}-{names.index(name)}')
+                            next_join += 1
+                            fresh = open_session(binary, endpoint, address, args.sample_rate,
+                                                 new_volumes[name], folder, f'join-{next_join}')
                         except OSError as exc:
                             if recovering:
+                                failed_receivers.add(name)
                                 publish('receiver_failed', receiver=name, message='не удалось заново открыть AirPlay', diagnostic=str(exc))
                             else:
                                 publish('receiver_skipped', receiver=name, message=str(exc), category='tv')

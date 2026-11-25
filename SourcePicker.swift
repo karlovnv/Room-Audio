@@ -8,25 +8,37 @@ struct RouteSourcePicker: View {
     let inputs: [AudioInput]
     @Binding var selection: RouteSourceChoice?
     var unavailableName: String? = nil
+    var compact = false
     @State private var showing = false
 
     var body: some View {
         HStack(spacing: 8) {
-            Text(title)
-            Button {
-                showing.toggle()
-            } label: {
-                HStack(spacing: 7) {
-                    Text(selectedName).lineLimit(1)
+            if compact {
+                pickerButton.buttonStyle(TextActionStyle(linkColor: true))
+            } else {
+                Text(title)
+                pickerButton
+            }
+        }
+    }
+
+    private var pickerButton: some View {
+        Button {
+            showing.toggle()
+        } label: {
+            HStack(spacing: 7) {
+                Text(compact && selection == nil ? (unavailableName ?? "Выбрать источник…") : selectedName)
+                    .lineLimit(1)
+                if !compact {
                     Image(systemName: "chevron.up.chevron.down").imageScale(.small)
                         .accessibilityHidden(true)
                 }
             }
-            .accessibilityLabel(title)
-            .accessibilityValue(selectedName)
-            .popover(isPresented: $showing, arrowEdge: .bottom) {
-                SourceChoices(inputs: inputs, selection: $selection) { showing = false }
-            }
+        }
+        .accessibilityLabel(title)
+        .accessibilityValue(selectedName)
+        .popover(isPresented: $showing, arrowEdge: .bottom) {
+            SourceChoices(inputs: inputs, selection: $selection) { showing = false }
         }
     }
 
@@ -36,6 +48,43 @@ struct RouteSourcePicker: View {
         case .device(let id): inputs.first(where: { $0.id == id })?.name ?? "Устройство недоступно"
         case nil: unavailableName ?? "Выбрать"
         }
+    }
+}
+
+struct TextActionStyle: ButtonStyle {
+    var linkColor = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        TextActionLabel(label: configuration.label, linkColor: linkColor, pressed: configuration.isPressed)
+    }
+}
+
+private struct TextActionLabel<Content: View>: View {
+    let label: Content
+    let linkColor: Bool
+    let pressed: Bool
+    @State private var hovering = false
+    @Environment(\.isFocused) private var focused
+
+    var body: some View {
+        label
+            .foregroundStyle(linkColor ? Color.accentColor : Color.primary)
+            .opacity(pressed ? 0.65 : 1)
+            .overlay(alignment: .bottom) {
+                if hovering || focused {
+                    GeometryReader { proxy in
+                        Path { line in
+                            line.move(to: CGPoint(x: 0, y: proxy.size.height))
+                            line.addLine(to: CGPoint(x: proxy.size.width, y: proxy.size.height))
+                        }
+                        .stroke(.secondary, style: StrokeStyle(lineWidth: 1, dash: [1, 2]))
+                    }
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
+                }
+            }
+            .contentShape(Rectangle())
+            .onHover { hovering = $0 }
     }
 }
 

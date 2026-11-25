@@ -12,8 +12,9 @@ private let audioCallback: AudioDeviceIOProc = { _, _, input, _, _, _, context i
     let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
     guard let first = buffers.first, let data = first.mData else { return noErr }
     let count = Int(first.mDataByteSize) / MemoryLayout<Float>.size
-    if buffers.count == 1, first.mNumberChannels == 2 {
-        capture.writeFrames(data.assumingMemoryBound(to: Float.self), right: nil, count: count / 2)
+    if buffers.count == 1, first.mNumberChannels > 0 {
+        let channels = Int(first.mNumberChannels)
+        capture.writeFrames(data.assumingMemoryBound(to: Float.self), right: nil, count: count / channels, channels: channels)
     } else if buffers.count == 2, first.mNumberChannels == 1, buffers[1].mNumberChannels == 1,
               let second = buffers[1].mData {
         capture.writeFrames(data.assumingMemoryBound(to: Float.self), right: second.assumingMemoryBound(to: Float.self),
@@ -26,6 +27,7 @@ final class Capture {
     private let id: AudioObjectID
     private let fd: Int32?
     private let localOutput: LocalPlayback?
+    private let mixInput: MixInputBuffer?
     private let pcm: UnsafeMutablePointer<Int16>
     private var callback: AudioDeviceIOProcID?
     let failed = Atomic<Bool>(false)
@@ -33,10 +35,11 @@ final class Capture {
     let sampleRate: Int
 
     init(id: AudioObjectID, fd: Int32?, tapFormat: AudioStreamBasicDescription? = nil,
-         localOutput: LocalPlayback? = nil) throws {
+         localOutput: LocalPlayback? = nil, mixInput: MixInputBuffer? = nil) throws {
         self.id = id
         self.fd = fd
         self.localOutput = localOutput
+        self.mixInput = mixInput
         var property = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamFormat,
                                                   mScope: kAudioObjectPropertyScopeInput,
                                                   mElement: kAudioObjectPropertyElementMain)
@@ -45,10 +48,13 @@ final class Capture {
             var size = UInt32(MemoryLayout.size(ofValue: format))
             try Self.check(AudioObjectGetPropertyData(id, &property, 0, nil, &size, &format))
         }
-        guard [44100.0, 48000.0].contains(format.mSampleRate), format.mChannelsPerFrame == 2,
+        let supported = mixInput == nil
+            ? [44100.0, 48000.0].contains(format.mSampleRate) && format.mChannelsPerFrame == 2
+            : (8000...192000).contains(format.mSampleRate) && (1...2).contains(format.mChannelsPerFrame)
+        guard supported,
               format.mFormatID == kAudioFormatLinearPCM, format.mBitsPerChannel == 32,
               format.mFormatFlags & kAudioFormatFlagIsFloat != 0 else {
-            throw StreamError("Требуется стереовход 44,1 или 48 кГц Float32.")
+            throw StreamError(mixInput == nil ? "Требуется стереовход 44,1 или 48 кГц Float32." : "Неподдерживаемый формат аудиовхода.")
         }
         sampleRate = Int(format.mSampleRate)
         if let fd {
@@ -78,7 +84,12 @@ final class Capture {
         pcm.deallocate()
     }
 
-    fileprivate func writeFrames(_ first: UnsafePointer<Float>, right: UnsafePointer<Float>?, count: Int) {
+    fileprivate func writeFrames(_ first: UnsafePointer<Float>, right: UnsafePointer<Float>?, count: Int, channels: Int = 2) {
+        if let mixInput {
+            mixInput.enqueue(first, right: right, frames: count, channels: right == nil ? channels : 1)
+            return
+        }
+        guard right != nil || channels == 2 else { return }
         var offset = 0
         var maximum: Float = 0
         while offset < count {
@@ -119,6 +130,23 @@ final class Capture {
     }
 }
 
+extension Capture {
+    @MainActor
+    static func make(_ source: AudioSource, fd: Int32?, localOutput: LocalPlayback? = nil,
+                     mixInput: MixInputBuffer? = nil) throws -> (Capture, AppAudioTap?) {
+        switch source {
+        case .device(let id):
+            return (try Capture(id: id, fd: fd, localOutput: localOutput, mixInput: mixInput), nil)
+        case .application(let ids, let playLocally):
+            let tap = try AppAudioTap(processes: ids, playLocally: playLocally)
+            return (try Capture(id: tap.device, fd: fd, tapFormat: tap.format,
+                                localOutput: localOutput, mixInput: mixInput), tap)
+        case .mix:
+            throw StreamError("Микшер доступен для сохранённых групп.")
+        }
+    }
+}
+
 struct StreamError: LocalizedError {
     let message: String
     init(_ message: String) { self.message = message }
@@ -142,6 +170,8 @@ final class Streaming: ObservableObject {
     private var lastSignalAt: ContinuousClock.Instant?
     private var supervisor: Process?
     private var capture: Capture?
+    private var mixer: GroupMixer?
+    @Published private(set) var mixStatus: [String: MixInputStatus] = [:]
     private var appTap: AppAudioTap?
     private var bluetooth: LocalPlayback?
     private var bluetoothName: String?
@@ -211,11 +241,29 @@ final class Streaming: ObservableObject {
             let sink = try FileHandle(forWritingTo: log)
             let statusSource = try FileHandle(forReadingFrom: log)
             let audio = Pipe()
-            let (capture, tap) = try makeCapture(source, fd: audio.fileHandleForWriting.fileDescriptor)
+            let fd = audio.fileHandleForWriting.fileDescriptor
+            let capture: Capture?
+            let tap: AppAudioTap?
+            let mixer: GroupMixer?
+            let sampleRate: Int
+            if case .mix(let inputs) = source {
+                let groupMixer = try GroupMixer(fd: fd)
+                groupMixer.update(inputs)
+                mixer = groupMixer
+                capture = nil
+                tap = nil
+                sampleRate = groupMixer.sampleRate
+            } else {
+                let direct = try Capture.make(source, fd: fd)
+                capture = direct.0
+                tap = direct.1
+                mixer = nil
+                sampleRate = direct.0.sampleRate
+            }
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
             var arguments = [script.path, "--transport", transport.path, "--volumes", volumeFile.path,
-                             "--sample-rate", String(capture.sampleRate)]
+                             "--sample-rate", String(sampleRate)]
             if let sharedClockAddress { arguments += ["--use-shared-clock", "--clock-address", sharedClockAddress] }
             if protectSonos { arguments.append("--protect-sonos") }
             if protectSonos { arguments += ["--tv-join-file", joinFile.path] }
@@ -229,6 +277,7 @@ final class Streaming: ObservableObject {
             try? sink.close()
             self.supervisor = process
             self.capture = capture
+            self.mixer = mixer
             self.appTap = tap
             self.audio = audio
             self.statusRead = statusSource
@@ -250,7 +299,7 @@ final class Streaming: ObservableObject {
         do {
             let player = try LocalPlayback(device: output)
             player.level.store(volume, ordering: .relaxed)
-            let (capture, tap) = try makeCapture(source, fd: nil, localOutput: player)
+            let (capture, tap) = try Capture.make(source, fd: nil, localOutput: player)
             try player.start(inputRate: capture.sampleRate)
             try capture.start()
             self.capture = capture
@@ -272,14 +321,8 @@ final class Streaming: ObservableObject {
         bluetooth?.renderedNonSilentFrames.load(ordering: .relaxed) ?? 0
     }
 
-    private func makeCapture(_ source: AudioSource, fd: Int32?, localOutput: LocalPlayback? = nil) throws -> (Capture, AppAudioTap?) {
-        switch source {
-        case .device(let id):
-            return (try Capture(id: id, fd: fd, localOutput: localOutput), nil)
-        case .application(let ids, let playLocally):
-            let tap = try AppAudioTap(processes: ids, playLocally: playLocally)
-            return (try Capture(id: tap.device, fd: fd, tapFormat: tap.format, localOutput: localOutput), tap)
-        }
+    func updateMix(_ inputs: [MixInput]) {
+        mixer?.update(inputs)
     }
 
     private func monitorBluetooth(_ output: LocalOutput, player: LocalPlayback) async {
@@ -314,14 +357,21 @@ final class Streaming: ObservableObject {
     }
 
     private func updateMeter() {
-        if let capture {
-            let peak = Float(bitPattern: capture.peak.exchange(0, ordering: .relaxed))
-            signalLevel = max(peak, signalLevel * 0.65)
-            let now = ContinuousClock.now
-            if peak >= 0.001 { lastSignalAt = now }
-            let recent = lastSignalAt.map { $0.duration(to: now) < .seconds(2) } ?? false
-            if recent != hasRecentSignal { hasRecentSignal = recent }
+        let level: Float
+        if let mixer {
+            let (peak, statuses) = mixer.meter()
+            level = peak
+            if mixStatus != statuses { mixStatus = statuses }
+        } else if let capture {
+            level = Float(bitPattern: capture.peak.exchange(0, ordering: .relaxed))
+        } else {
+            return
         }
+        signalLevel = max(level, signalLevel * 0.65)
+        let now = ContinuousClock.now
+        if level >= 0.001 { lastSignalAt = now }
+        let recent = lastSignalAt.map { $0.duration(to: now) < .seconds(2) } ?? false
+        if recent != hasRecentSignal { hasRecentSignal = recent }
     }
 
     private func clearSignal() {
@@ -373,6 +423,11 @@ final class Streaming: ObservableObject {
         _ = requestJoin(receiver, volume: volume, token: "recover:\(UUID())")
     }
 
+    func joinTransferredReceiver(_ receiver: String, volume: Int) -> Bool {
+        guard currentVolumes[receiver] == nil else { return false }
+        return requestJoin(receiver, volume: volume, token: "transfer:\(UUID())")
+    }
+
     private func requestJoin(_ receiver: String, volume: Int, token: String) -> Bool {
         guard isTransmitting, !stopping, let volumesFile, let joinsFile else { return false }
         do {
@@ -381,7 +436,12 @@ final class Streaming: ObservableObject {
             var volumes = currentVolumes
             volumes[receiver] = volume
             try JSONEncoder().encode(volumes).write(to: volumesFile, options: .atomic)
-            try JSONEncoder().encode(requests).write(to: joinsFile, options: .atomic)
+            do {
+                try JSONEncoder().encode(requests).write(to: joinsFile, options: .atomic)
+            } catch {
+                try? JSONEncoder().encode(currentVolumes).write(to: volumesFile, options: .atomic)
+                throw error
+            }
             joinRequests = requests
             currentVolumes = volumes
             receiversBlockedByTV.remove(receiver)
@@ -407,6 +467,7 @@ final class Streaming: ObservableObject {
     }
 
     private func shutdown() {
+        mixer?.stop()
         capture?.stop()
         try? audio?.fileHandleForWriting.close()
         if let supervisor, supervisor.isRunning { supervisor.terminate() }
@@ -430,6 +491,7 @@ final class Streaming: ObservableObject {
                 case "capture":
                     do {
                         try capture?.start()
+                        mixer?.start()
                         status = "Синхронизация AirPlay…"
                     } catch {
                         terminalError = error.localizedDescription
@@ -469,7 +531,7 @@ final class Streaming: ObservableObject {
                 default: break
                 }
             }
-            if capture?.failed.load(ordering: .relaxed) == true && terminalError == nil && !stopping {
+            if (capture?.failed.load(ordering: .relaxed) == true || mixer?.failed == true) && terminalError == nil && !stopping {
                 terminalError = "Передатчик не успевает принять аудиопоток"
                 shutdown()
             }
@@ -483,6 +545,9 @@ final class Streaming: ObservableObject {
             }
             try? await Task.sleep(for: .milliseconds(100))
         }
+        mixer?.stop()
+        mixer = nil
+        mixStatus = [:]
         capture?.stop()
         try? statusRead?.close()
         try? audio?.fileHandleForWriting.close()

@@ -2,9 +2,10 @@ import AppKit
 import CoreAudio
 import Synchronization
 
-enum AudioSource {
+enum AudioSource: Equatable {
     case device(AudioObjectID)
     case application([AudioObjectID], playLocally: Bool)
+    indirect case mix([MixInput])
 }
 
 @MainActor
@@ -14,6 +15,7 @@ struct RunningAudioApp: Identifiable, Equatable {
     let bundleID: String?
     var hasActiveOutput = false
     var activeAudioObjects: [AudioObjectID] = []
+    var audioProcessObjects: [AudioObjectID] = []
 
     static func list() -> [Self] {
         let clients = (try? ProcessAudioClient.snapshot()) ?? []
@@ -21,7 +23,9 @@ struct RunningAudioApp: Identifiable, Equatable {
             guard app.activationPolicy == .regular, !app.isTerminated,
                   app.processIdentifier != getpid(), let name = app.localizedName else { return nil }
             var result = Self(id: app.processIdentifier, name: name, bundleID: app.bundleIdentifier)
-            result.activeAudioObjects = clients.filter { $0.outputActive && result.includes($0) }.map(\.object).sorted()
+            let matching = clients.filter(result.includes)
+            result.audioProcessObjects = matching.map(\.object).sorted()
+            result.activeAudioObjects = matching.filter(\.outputActive).map(\.object).sorted()
             result.hasActiveOutput = !result.activeAudioObjects.isEmpty
             return result
         }.sorted {

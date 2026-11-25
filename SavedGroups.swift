@@ -1,11 +1,12 @@
 import Combine
 import SwiftUI
 
-struct SavedGroupSource: Codable, Equatable {
+struct SavedGroupSource: Codable, Equatable, Identifiable {
     enum Kind: String, Codable { case app, device }
     let kind: Kind
     let identifier: String
     let name: String
+    var id: String { "\(kind.rawValue):\(identifier)" }
 
     @MainActor
     init?(choice: RouteSourceChoice, apps: [RunningAudioApp], inputs: [AudioInput]) {
@@ -36,17 +37,42 @@ struct SavedGroupSource: Codable, Equatable {
     }
 }
 
+struct GroupInput: Identifiable, Codable, Equatable {
+    let source: SavedGroupSource
+    var gain: Double = 100
+    var muted = false
+    var playLocally = false
+    var id: String { source.id }
+}
+
 struct SpeakerGroup: Identifiable, Codable, Equatable {
     var id = UUID()
     var name: String
     var members: Set<Receiver.ID>
     var source: SavedGroupSource?
     var playLocally = false
+    var mixInputs: [GroupInput]? = nil
+
+    var configuredInputs: [GroupInput] {
+        if let mixInputs { return mixInputs }
+        return source.map { [GroupInput(source: $0, playLocally: playLocally)] } ?? []
+    }
+
+    var inputSummary: String {
+        let inputs = configuredInputs
+        guard let first = inputs.first else { return "Нет источников" }
+        return first.source.name + (inputs.count > 1 ? " + \(inputs.count - 1)" : "")
+    }
+
+    mutating func setInputs(_ inputs: [GroupInput]) {
+        var seen = Set<String>()
+        mixInputs = inputs.filter { seen.insert($0.id).inserted }
+        source = mixInputs?.first?.source
+        playLocally = mixInputs?.first?.playLocally ?? false
+    }
 }
 
 struct SavedGroupPlayback {
-    let source: SavedGroupSource
-    let playLocally: Bool
     var receivers: Set<Receiver.ID>
     var hasPlayed = false
     var retry = RecoveryRetry()
@@ -120,6 +146,9 @@ final class SpeakerGroups: ObservableObject {
             session.objectWillChange.sink { [weak self] _ in
                 MainActor.assumeIsolated { self?.objectWillChange.send() }
             },
+            session.stream.$mixStatus.dropFirst().sink { [weak self] _ in
+                MainActor.assumeIsolated { self?.objectWillChange.send() }
+            },
             session.stream.$skippedReceivers.dropFirst().sink { [weak self] _ in
                 MainActor.assumeIsolated { self?.objectWillChange.send() }
             },
@@ -168,7 +197,7 @@ final class SpeakerGroups: ObservableObject {
     func save(_ group: SpeakerGroup) {
         var saved = group
         saved.name = saved.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !saved.name.isEmpty, saved.members.count >= 2 else { return }
+        guard !saved.name.isEmpty, !saved.members.isEmpty else { return }
         if let index = groups.firstIndex(where: { $0.id == saved.id }) {
             groups[index] = saved
         } else {
@@ -245,6 +274,20 @@ func verifySavedGroups() {
         guard reloaded.groups == [group], reloaded.session(for: group.id) != nil,
               source.choice(apps: [], inputs: [.init(id: 993, name: "BlackHole 2ch", uid: "test-device-uid")]) == .device(993) else { return false }
         print("GROUP_PERSISTED_WITH_SOURCE_AND_MEMBERS")
+        var mixed = group
+        mixed.playLocally = true
+        guard mixed.configuredInputs == [GroupInput(source: source, playLocally: true)] else { return false }
+        let application = SavedGroupSource(kind: .app, identifier: "com.google.Chrome", name: "Google Chrome")
+        let configured = [GroupInput(source: application, gain: 68, playLocally: true),
+                          GroupInput(source: source, gain: 24, muted: true)]
+        mixed.setInputs(configured + configured)
+        reloaded.save(mixed)
+        guard SpeakerGroups(defaults: defaults).groups.first?.configuredInputs == configured else { return false }
+        mixed.setInputs([])
+        reloaded.save(mixed)
+        guard SpeakerGroups(defaults: defaults).groups.first?.configuredInputs.isEmpty == true else { return false }
+        reloaded.save(group)
+        print("MIXER_INPUTS_MIGRATE_AND_PERSIST_LEVELS_AND_MUTE")
         let plan = GroupAvailability(members: group.members, available: [k, l]) { $0 == k ? "Telegram" : nil }
         guard plan.ready == [l], plan.busy == ["Kitchen (Telegram)"], plan.unavailable == ["Offline"] else { return false }
         guard let session = reloaded.session(for: group.id) else { return false }
@@ -301,7 +344,17 @@ func verifySavedGroups() {
         edited.name = "Дома"
         reloaded.save(edited)
         guard SpeakerGroups(defaults: defaults).groups == [edited] else { return false }
+        edited.members = [k]
+        reloaded.save(edited)
+        let single = SpeakerGroup(name: "Одна колонка", members: [l], source: source)
+        reloaded.save(single)
+        var empty = edited
+        empty.members = []
+        reloaded.save(empty)
+        guard SpeakerGroups(defaults: defaults).groups == [edited, single] else { return false }
+        print("SINGLE_OUTPUT_GROUP_CREATED_AND_EDITED")
         reloaded.remove(group.id)
+        reloaded.remove(single.id)
         guard SpeakerGroups(defaults: defaults).groups.isEmpty else { return false }
         print("GROUP_EDIT_AND_DELETE_PERSISTED")
         return true
@@ -314,123 +367,148 @@ struct SavedGroupsSection: View {
     @ObservedObject var workspace: RoutingWorkspace
     @ObservedObject var groups: SpeakerGroups
     let simpleMode: Bool
-    @State private var draft: SpeakerGroup?
-    @State private var editingID: UUID?
-
-    private var available: Set<Receiver.ID> {
-        Set(workspace.destinations.compactMap { if case .airplay(let id) = $0 { id } else { nil } })
-    }
 
     var body: some View {
         Section("Группы") {
             ForEach(groups.groups) { group in
                 if let session = groups.session(for: group.id) {
                     SavedGroupRow(group: group, session: session, stream: session.stream,
-                                  workspace: workspace, groups: groups, simpleMode: simpleMode) {
-                        draft = group
-                        editingID = group.id
-                    }
+                                  workspace: workspace, groups: groups, simpleMode: simpleMode)
                 }
-            }
-            if !simpleMode, let draft {
-                editor(draft)
-            } else if !simpleMode {
-                Button {
-                    draft = SpeakerGroup(name: "", members: [], source: nil)
-                    editingID = nil
-                } label: {
-                    Label("Группа", systemImage: "plus")
-                }
-                .buttonStyle(.borderless)
-                .accessibilityLabel("Добавить группу")
             }
         }
-    }
-
-    private func editor(_ group: SpeakerGroup) -> some View {
-        let devices = available.union(group.members).sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        return VStack(alignment: .leading, spacing: 8) {
-            TextField("Название группы", text: Binding(
-                get: { draft?.name ?? "" }, set: { draft?.name = $0 }
-            ))
-            ForEach(devices, id: \.self) { device in
-                Toggle(device.name + (available.contains(device) ? "" : " · недоступна"), isOn: Binding(
-                    get: { draft?.members.contains(device) == true },
-                    set: { enabled in
-                        if enabled { draft?.members.insert(device) }
-                        else { draft?.members.remove(device) }
-                    }
-                )).toggleStyle(.checkbox)
-            }
-            HStack {
-                if let editingID {
-                    Button("Удалить", role: .destructive) {
-                        groups.remove(editingID)
-                        draft = nil
-                    }
-                }
-                Spacer()
-                Button("Отмена") { draft = nil }
-                Button("Сохранить") {
-                    // A second view can change the source while this editor is open.
-                    var updated = group
-                    if let latest = groups.groups.first(where: { $0.id == group.id }) {
-                        updated.source = latest.source
-                        updated.playLocally = latest.playLocally
-                    }
-                    groups.save(updated)
-                    draft = nil
-                }
-                .disabled(group.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || group.members.count < 2)
-            }.buttonStyle(.borderless)
-        }.padding(.vertical, 4)
     }
 }
 
 @MainActor
-private struct SavedGroupRow: View {
+struct SavedGroupRow: View {
     let group: SpeakerGroup
     @ObservedObject var session: SynchronizedGroup
     @ObservedObject var stream: Streaming
     @ObservedObject var workspace: RoutingWorkspace
     @ObservedObject var groups: SpeakerGroups
     let simpleMode: Bool
-    let edit: () -> Void
+    var compact = false
+    @Environment(\.openWindow) private var openWindow
+    @State private var expanded = false
 
     private var active: Bool { session.active }
     private var recovering: Bool { workspace.recoveringGroups.contains(group.id) }
 
-    private var source: Binding<RouteSourceChoice?> {
-        Binding(
-            get: { group.source?.choice(apps: workspace.apps, inputs: workspace.inputs) },
-            set: { choice in
-                var updated = group
-                if let choice { updated.source = SavedGroupSource(choice: choice, apps: workspace.apps, inputs: workspace.inputs) }
-                else { updated.source = nil }
-                session.error = nil
-                groups.save(updated)
-            }
-        )
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            header
-            if let currentSource = session.sourceName ?? (recovering ? workspace.groupPlayback[group.id]?.source.name : nil) {
-                LabeledContent("Текущий источник", value: currentSource)
-            } else if simpleMode, let name = group.source?.name {
-                LabeledContent("Источник", value: name)
+            if compact {
+                compactHeader
+                compactSummary
+                if expanded { compactMembers }
+            } else {
+                header
+                sourcesLink
+                if !simpleMode {
+                    Text(group.members.map(\.name).sorted().joined(separator: " · "))
+                        .lineLimit(1).font(.caption).foregroundStyle(.secondary)
+                }
+                volumeControl
+                summary
             }
-            if !simpleMode {
-                sourceControls
-                Text(group.members.map(\.name).sorted().joined(separator: " · "))
-                    .lineLimit(1).font(.caption).foregroundStyle(.secondary)
-            }
-            volumeControl
-            summary
         }
         .padding(.vertical, 4)
+    }
 
+    private var sourcesLink: some View {
+        Button(group.configuredInputs.isEmpty ? "Выбрать источники…" : group.inputSummary) {
+            RoomAudioDelegate.openGroupWindow(openWindow, id: group.id)
+        }
+        .buttonStyle(TextActionStyle(linkColor: true))
+        .accessibilityLabel("Источники группы \(group.name)")
+        .accessibilityValue(group.inputSummary)
+    }
+
+    private var connected: Set<String> {
+        session.transmittingReceivers.intersection(group.members.map(\.name))
+    }
+
+    private var compactHeader: some View {
+        HStack(spacing: 12) {
+            Button {
+                expanded.toggle()
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "hifispeaker.2").accessibilityHidden(true)
+                    Text(group.name).lineLimit(1)
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2).foregroundStyle(.secondary).accessibilityHidden(true)
+                    if workspace.isReconnecting(group: group.id) || session.isConnecting {
+                        ConnectionIcon(reconnecting: workspace.isReconnecting(group: group.id))
+                    }
+                }
+                .font(.headline)
+            }
+            .buttonStyle(TextActionStyle())
+            .accessibilityValue(expanded ? "Состав раскрыт" : "Состав свёрнут")
+            .help(expanded ? "Свернуть состав" : "Показать состав")
+            .frame(width: VolumeSlider.compactCaptionWidth, alignment: .leading)
+            HStack(spacing: 8) {
+                volumeControl.opacity(active || recovering ? 1 : 0)
+                    .disabled(!active && !recovering)
+                    .accessibilityHidden(!active && !recovering)
+                transmissionControl.frame(width: 28)
+            }
+        }
+    }
+
+    private var compactSummary: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 5) {
+                sourcesLink
+                if active || recovering {
+                    Text("· \(connected.count) из \(group.members.count) подключено")
+                        .fixedSize()
+                }
+            }
+            if !active, !recovering, !expanded {
+                Text(group.members.map(\.name).sorted().joined(separator: " · ")).lineLimit(1)
+            }
+            if !connected.isEmpty && !stream.hasRecentSignal { Text("Нет сигнала") }
+            if let error = session.error { Text(error) }
+        }
+        .font(.caption).foregroundStyle(.secondary)
+        .padding(.leading, 19)
+    }
+
+    private var compactMembers: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(group.members.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }, id: \.self) { receiver in
+                let name = receiver.name
+                let available = workspace.destinations.contains(.airplay(receiver))
+                let owner = workspace.otherSource(for: receiver, session: session)
+                let busyTV = stream.receiversBlockedByTV.contains(name)
+                HStack(spacing: 6) {
+                    Text(name)
+                    if workspace.receiverTransfers[receiver] == group.id { ConnectionIcon(reconnecting: false) }
+                    let status = if !available { "Недоступна" }
+                    else if let owner { "Занята · \(owner)" }
+                    else if connected.contains(name) { "Подключена" }
+                    else if session.isConnecting(to: name) { "Подключение…" }
+                    else if let failure = failure(for: name),
+                            failure != "колонка недоступна", !failure.hasPrefix("уже используется:") { failure }
+                    else { "Свободна" }
+                    Text(status).foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                    if available && (owner != nil || busyTV) {
+                        Button("Забрать") {
+                            if owner != nil { workspace.takeReceiver(receiver, into: group, session: session) }
+                            else { workspace.forcePlay(receiver, group: group, session: session) }
+                        }
+                        .buttonStyle(TextActionStyle(linkColor: true))
+                        .accessibilityLabel("Забрать \(name) в \(group.name)")
+                        .disabled(!workspace.canTakeReceiver(receiver, into: group, session: session))
+                    }
+                }
+            }
+        }
+        .font(.caption)
+        .padding(.leading, 19)
     }
 
     private var volumeControl: some View {
@@ -438,7 +516,7 @@ private struct SavedGroupRow: View {
         return VolumeSlider(name: group.name, value: Binding(
             get: { workspace.groupVolumeLevels(for: group, session: session).values.max() ?? 0 },
             set: { workspace.setGroupVolume($0, for: group, session: session) }
-        ), showsSignalColumn: !simpleMode, available: maximum != nil)
+        ), showsSignalColumn: !simpleMode, available: maximum != nil, hidesCaption: compact)
         .disabled(maximum == nil || stream.stopping)
         .help("Громкость самой громкой колонки, доступной группе")
     }
@@ -450,43 +528,32 @@ private struct SavedGroupRow: View {
             if reconnecting || session.isConnecting { ConnectionIcon(reconnecting: reconnecting) }
             Spacer()
             if !simpleMode {
-                Button(action: edit) { Image(systemName: "pencil") }
+                Button {
+                    RoomAudioDelegate.openGroupWindow(openWindow, id: group.id)
+                } label: { Image(systemName: "pencil") }
                     .buttonStyle(.borderless)
                     .accessibilityLabel("Изменить группу \(group.name)")
-                    .disabled(active || recovering)
             }
-            Button {
-                if active || recovering { workspace.stopSavedGroup(group, session: session) }
-                else { workspace.startSavedGroup(group, session: session) }
-            } label: {
-                transmissionLabel(active || recovering ? "Остановить передачу" : "Передавать",
-                                  active: active || recovering, compact: simpleMode)
-            }
-            .buttonStyle(.bordered)
-            .disabled((stream.stopping && !recovering) || (!active && !recovering && group.source == nil))
+            transmissionControl
         }
     }
 
-    private var sourceControls: some View {
-        HStack {
-            RouteSourcePicker(title: active || recovering ? "Следующий источник" : "Источник",
-                              apps: workspace.apps, inputs: workspace.inputs, selection: source,
-                              unavailableName: group.source.map { $0.name + " · недоступен" })
-            if group.source?.kind == .app {
-                Toggle("Также на Mac", isOn: Binding(
-                    get: { group.playLocally },
-                    set: {
-                        var updated = group
-                        updated.playLocally = $0
-                        groups.save(updated)
-                    }
-                )).toggleStyle(.checkbox)
-            }
+    private var transmissionControl: some View {
+        Button {
+            if active || recovering { workspace.stopSavedGroup(group, session: session) }
+            else { workspace.startSavedGroup(group, session: session) }
+        } label: {
+            transmissionLabel(active || recovering ? "Остановить передачу" : "Передавать",
+                              active: active || recovering, compact: simpleMode)
         }
+        .buttonStyle(.bordered)
+        .accessibilityLabel(active || recovering ? "Остановить \(group.name)" : "Передавать на \(group.name)")
+        .disabled((stream.stopping && !recovering) || (!active && !recovering && group.configuredInputs.isEmpty))
+        .disabled(!active && !recovering && workspace.receiverTransfers.values.contains(group.id))
     }
 
     @ViewBuilder private var summary: some View {
-        let playing = session.transmittingReceivers.intersection(group.members.map(\.name))
+        let playing = connected
         let names = playing.sorted().joined(separator: ", ")
         let detail = if !playing.isEmpty { names }
             else if session.preparing { "Подготовка…" }
@@ -502,12 +569,16 @@ private struct SavedGroupRow: View {
             Text(error).font(.caption).foregroundStyle(.secondary)
         }
         ForEach(group.members.map(\.name).sorted(), id: \.self) { name in
-            if let reason = session.reason(for: name) {
-                let detail = stream.receiversBlockedByTV.contains(name) && reason == tvInputBusyMessage
-                    ? groups.tvOccupation(for: name) : reason
+            if let detail = failure(for: name) {
                 Text("\(name): \(detail)").font(.caption).foregroundStyle(.secondary)
             }
         }
+    }
+
+    private func failure(for name: String) -> String? {
+        guard let reason = session.reason(for: name) else { return nil }
+        return stream.receiversBlockedByTV.contains(name) && reason == tvInputBusyMessage
+            ? groups.tvOccupation(for: name) : reason
     }
 }
 
@@ -520,14 +591,81 @@ extension RoutingWorkspace {
         }
     }
 
-    private func otherSource(for id: Receiver.ID, session: SynchronizedGroup) -> String? {
+    func otherSource(for id: Receiver.ID, session: SynchronizedGroup, includeTransfer: Bool = true) -> String? {
         if session.members.contains(id.name) { return nil }
         if let name = savedGroups.ownerName(of: id.name) { return name }
         if synchronizedGroup.members.contains(id.name) { return synchronizedGroup.sourceName ?? "быстрая группа" }
         if let route = routes[.airplay(id)], route.starting || route.stream.active {
             return route.runningSourceName ?? "отдельный маршрут"
         }
+        if includeTransfer, let target = receiverTransfers[id], savedGroups.session(for: target) !== session {
+            return "переключение"
+        }
         return nil
+    }
+
+    func canTakeReceiver(_ receiver: Receiver.ID, into group: SpeakerGroup, session: SynchronizedGroup) -> Bool {
+        guard group.members.contains(receiver), destinations.contains(.airplay(receiver)),
+              receiverTransfers[receiver] == nil, !waitingForWake, !recoveringGroups.contains(group.id),
+              !session.stream.stopping else { return false }
+        return session.active ? session.stream.isTransmitting : !group.configuredInputs.isEmpty
+    }
+
+    func takeReceiver(_ receiver: Receiver.ID, into group: SpeakerGroup, session: SynchronizedGroup) {
+        guard canTakeReceiver(receiver, into: group, session: session),
+              otherSource(for: receiver, session: session, includeTransfer: false) != nil else { return }
+        let name = receiver.name
+        // Reserve the output until the old transport confirms that its session ended.
+        receiverTransfers[receiver] = group.id
+        session.error = nil
+        if let owner = savedGroups.owner(of: name) {
+            stopSavedGroupReceiver(receiver, session: owner)
+        } else if synchronizedGroup.members.contains(name) {
+            synchronizedGroup.stream.stopReceiver(name)
+        } else {
+            routes[.airplay(receiver)]?.stop()
+        }
+
+        receiverTransferTasks[receiver] = Task {
+            defer {
+                if !Task.isCancelled {
+                    receiverTransfers.removeValue(forKey: receiver)
+                    receiverTransferTasks.removeValue(forKey: receiver)
+                }
+            }
+            let deadline = ContinuousClock().now + .seconds(6)
+            while otherSource(for: receiver, session: session, includeTransfer: false) != nil {
+                guard ContinuousClock().now < deadline else {
+                    session.error = "\(name): не удалось освободить выход."
+                    return
+                }
+                do { try await Task.sleep(for: .milliseconds(100)) }
+                catch { return }
+            }
+            guard !Task.isCancelled, !waitingForWake,
+                  let latest = savedGroups.groups.first(where: { $0.id == group.id }),
+                  latest.members.contains(receiver), destinations.contains(.airplay(receiver)) else { return }
+            if session.active {
+                let volume = Int(speakerVolume(receiver).rounded())
+                guard session.joinTransferredReceiver(name, volume: volume) else {
+                    session.error = "\(name): не удалось подключить к \(group.name)."
+                    return
+                }
+                groupPlayback[group.id]?.receivers.insert(receiver)
+            } else {
+                var selection = latest
+                selection.members = [receiver]
+                startSavedGroup(selection, session: session)
+            }
+        }
+    }
+
+    func cancelReceiverTransfers(to group: UUID? = nil) {
+        let cancelled = receiverTransfers.filter { group == nil || $0.value == group }.keys
+        for receiver in cancelled {
+            receiverTransferTasks.removeValue(forKey: receiver)?.cancel()
+            receiverTransfers.removeValue(forKey: receiver)
+        }
     }
 
     private func speakerVolume(_ id: Receiver.ID) -> Double {
@@ -572,6 +710,41 @@ extension RoutingWorkspace {
         }
     }
 
+    func updateGroupInputs(_ inputs: [GroupInput], in groupID: UUID) {
+        guard var group = savedGroups.groups.first(where: { $0.id == groupID }) else { return }
+        group.setInputs(inputs)
+        savedGroups.save(group)
+        if let session = savedGroups.session(for: groupID), session.active {
+            session.setMix(resolveMix(for: group), title: group.inputSummary)
+        }
+    }
+
+    func refreshSavedGroupMixes() {
+        for group in savedGroups.groups where groupPlayback[group.id] != nil {
+            guard let session = savedGroups.session(for: group.id), session.active, !session.stream.stopping else { continue }
+            session.setMix(resolveMix(for: group), title: group.inputSummary)
+        }
+    }
+
+    private func resolveMix(for group: SpeakerGroup) -> [MixInput] {
+        group.configuredInputs.map { input in
+            let source: AudioSource?
+            let unavailable: String?
+            switch input.source.kind {
+            case .app:
+                let app = apps.first { ($0.bundleID ?? $0.name) == input.source.identifier }
+                let objects = app?.audioProcessObjects ?? []
+                source = objects.isEmpty ? nil : .application(objects, playLocally: input.playLocally)
+                unavailable = app == nil ? "Приложение закрыто" : "Ожидание звука"
+            case .device:
+                source = inputs.first { $0.uid == input.source.identifier }.map { .device($0.id) }
+                unavailable = "Вход недоступен"
+            }
+            return MixInput(id: input.id, source: source, gain: input.gain, muted: input.muted,
+                            unavailable: source == nil ? unavailable : nil)
+        }
+    }
+
     func startSavedGroup(_ group: SpeakerGroup, session: SynchronizedGroup, overrideTV receiver: Receiver.ID? = nil) {
         guard !session.active else { return }
         guard !waitingForWake else { return }
@@ -587,18 +760,13 @@ extension RoutingWorkspace {
                     throw StreamError("\(receiver.name) больше недоступна для переключения.")
                 }
             }
-            let apps = RunningAudioApp.list()
-            let inputs = try AudioInput.list()
-            guard let saved = group.source, let choice = saved.choice(apps: apps, inputs: inputs) else {
-                throw StreamError("Источник группы недоступен. Открой приложение или выбери другой источник.")
-            }
-            let (source, title) = try resolveSource(choice, apps: apps, inputs: inputs, playLocally: group.playLocally)
+            guard !group.configuredInputs.isEmpty else { throw StreamError("Выбери источники группы.") }
             let volumes = Dictionary(plan.ready.map { ($0.name, Int(speakerVolume($0).rounded())) },
                                      uniquingKeysWith: { first, _ in first })
-            session.start(source, title: title, volumes: volumes, clock: clock, protectSonos: true,
-                          overrideTV: Set(receiver.map { [$0.name] } ?? []), exclusions: plan.exclusions)
-            groupPlayback[group.id] = SavedGroupPlayback(source: saved, playLocally: group.playLocally,
-                                                         receivers: Set(plan.ready))
+            session.start(.mix(resolveMix(for: group)), title: group.inputSummary, volumes: volumes,
+                          clock: clock, protectSonos: true, overrideTV: Set(receiver.map { [$0.name] } ?? []),
+                          exclusions: plan.exclusions)
+            groupPlayback[group.id] = SavedGroupPlayback(receivers: Set(plan.ready))
         } catch {
             if receiver == nil {
                 session.recordAttempt(receivers: Set(plan.ready.map(\.name)), exclusions: plan.exclusions)
@@ -608,6 +776,7 @@ extension RoutingWorkspace {
     }
 
     func stopSavedGroup(_ group: SpeakerGroup, session: SynchronizedGroup) {
+        cancelReceiverTransfers(to: group.id)
         groupPlayback.removeValue(forKey: group.id)
         recoveringGroups.remove(group.id)
         setRecoveringReceivers([], in: group.id)
@@ -627,6 +796,7 @@ extension RoutingWorkspace {
 
     func prepareSavedGroupsForSleep() {
         guard !waitingForWake else { return }
+        cancelReceiverTransfers()
         waitingForWake = true
         for id in Array(groupPlayback.keys) {
             guard let session = savedGroups.session(for: id) else { continue }
@@ -700,11 +870,11 @@ extension RoutingWorkspace {
             groupPlayback[id] = playback
             group.members.formIntersection(playback.receivers)
             let plan = availability(for: group, session: session)
-            guard !plan.ready.isEmpty, let choice = playback.source.choice(apps: apps, inputs: inputs),
-                  let (audio, title) = try? resolveSource(choice, apps: apps, inputs: inputs, playLocally: playback.playLocally) else { continue }
+            guard !plan.ready.isEmpty else { continue }
             let volumes = Dictionary(plan.ready.map { ($0.name, Int(speakerVolume($0).rounded())) },
                                      uniquingKeysWith: { first, _ in first })
-            session.start(audio, title: title, volumes: volumes, clock: clock, protectSonos: true, exclusions: plan.exclusions)
+            session.start(.mix(resolveMix(for: group)), title: group.inputSummary, volumes: volumes,
+                          clock: clock, protectSonos: true, exclusions: plan.exclusions)
         }
     }
 

@@ -7,6 +7,16 @@ struct AudioInput: Identifiable, Equatable {
     let id: AudioObjectID
     let name: String
     let uid: String
+    var transportType: UInt32 = 0
+
+    var symbol: String {
+        switch transportType {
+        case kAudioDeviceTransportTypeBuiltIn: "mic"
+        case kAudioDeviceTransportTypeUSB: "cable.connector"
+        case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE: "headphones"
+        default: "waveform"
+        }
+    }
 
     static func list() throws -> [Self] {
         var property = address(kAudioHardwarePropertyDevices)
@@ -25,7 +35,11 @@ struct AudioInput: Identifiable, Equatable {
                   streamSize > 0 else { return nil }
             guard let name = string(id, kAudioObjectPropertyName),
                   let uid = string(id, kAudioDevicePropertyDeviceUID) else { return nil }
-            return Self(id: id, name: name, uid: uid)
+            var transportProperty = address(kAudioDevicePropertyTransportType)
+            var transport: UInt32 = 0
+            var transportSize = UInt32(MemoryLayout<UInt32>.size)
+            _ = AudioObjectGetPropertyData(id, &transportProperty, 0, nil, &transportSize, &transport)
+            return Self(id: id, name: name, uid: uid, transportType: transport)
         }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
@@ -604,27 +618,33 @@ final class RoomAudioDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func windowWillClose(_ notification: Notification) {
-        guard !quitting, let window = notification.object as? NSWindow, Self.isMainWindow(window) else { return }
+        guard !quitting, let window = notification.object as? NSWindow, Self.isRoomAudioWindow(window) else { return }
         Task { @MainActor in
-            guard !quitting, !NSApp.windows.contains(where: { $0 !== window && $0.isVisible && Self.isMainWindow($0) }),
+            guard !quitting, !NSApp.windows.contains(where: { $0 !== window && $0.isVisible && Self.isRoomAudioWindow($0) }),
                   !window.isVisible else { return }
             NSApp.setActivationPolicy(.accessory)
         }
     }
 
     @objc private func windowDidBecomeKey(_ notification: Notification) {
-        guard let window = notification.object as? NSWindow, Self.isMainWindow(window),
+        guard let window = notification.object as? NSWindow, Self.isRoomAudioWindow(window),
               NSApp.activationPolicy() != .regular else { return }
         NSApp.setActivationPolicy(.regular)
     }
 
-    private static func isMainWindow(_ window: NSWindow) -> Bool {
-        window.styleMask.contains(.titled) && window.title == "Room Audio"
+    private static func isRoomAudioWindow(_ window: NSWindow) -> Bool {
+        window.styleMask.contains(.titled) && ["Room Audio", "Группа Room Audio"].contains(window.title)
     }
 
     static func openMainWindow(_ openWindow: OpenWindowAction) {
         NSApp.setActivationPolicy(.regular)
         openWindow(id: "main")
+        NSApp.activate()
+    }
+
+    static func openGroupWindow(_ openWindow: OpenWindowAction, id: UUID) {
+        NSApp.setActivationPolicy(.regular)
+        openWindow(id: "group-mixer", value: id)
         NSApp.activate()
     }
 
@@ -648,29 +668,6 @@ final class RoomAudioDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-@MainActor
-private struct MenuBarRoutes: View {
-    let workspace: RoutingWorkspace
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some View {
-        VStack(spacing: 0) {
-            RoutingView(workspace: workspace)
-                .frame(width: 560, height: 490)
-            Divider()
-            HStack {
-                Button("Открыть окно") {
-                    RoomAudioDelegate.openMainWindow(openWindow)
-                }
-                Spacer()
-                Button("Остановить всё", action: workspace.stopAll)
-                Button("Выйти") { NSApp.terminate(nil) }
-            }
-            .padding(12)
-        }
-    }
-}
-
 @main
 struct RoomAudioApp: App {
     @NSApplicationDelegateAdaptor(RoomAudioDelegate.self) private var delegate
@@ -687,8 +684,16 @@ struct RoomAudioApp: App {
             }
         }.defaultSize(width: 600, height: 570)
 
+        WindowGroup("Группа Room Audio", id: "group-mixer", for: UUID.self) { $groupID in
+            if let groupID {
+                GroupEditor(groupID: groupID, workspace: workspace, groups: workspace.savedGroups)
+            }
+        }
+        .defaultSize(width: 530, height: 460)
+        .restorationBehavior(.disabled)
+
         MenuBarExtra {
-            MenuBarRoutes(workspace: workspace)
+            RoutingView(workspace: workspace, menuBar: true)
         } label: {
             let busy = workspace.isConnecting || workspace.isReconnecting
             let title = if workspace.isReconnecting { "Room Audio · Переподключение" }
