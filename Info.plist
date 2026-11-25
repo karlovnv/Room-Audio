@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>CFBundleExecutable</key><string>RoomAudio</string>
+    <key>CFBundleIdentifier</key><string>local.roomaudio.discovery</string>
+    <key>CFBundleName</key><string>Room Audio</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleVersion</key><string>27</string>
+    <key>CFBundleShortVersionString</key><string>0.12.9</string>
+    <key>LSMinimumSystemVersion</key><string>15.0</string>
+    <key>NSBonjourServices</key><array><string>_airplay._tcp</string></array>
+    <key>NSLocalNetworkUsageDescription</key><string>Room Audio ищет AirPlay-устройства в локальной сети.</string>
+    <key>NSMicrophoneUsageDescription</key><string>Room Audio читает звук с выбранного аудиовхода.</string>
+    <key>NSAudioCaptureUsageDescription</key><string>Room Audio определяет, какие приложения сейчас воспроизводят звук, и передаёт выбранный источник на колонки.</string>
+</dict></plist>
