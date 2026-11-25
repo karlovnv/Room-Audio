@@ -938,9 +938,14 @@ struct RoutingView: View {
                         get: { workspace.groupSelection.contains(destination.id) },
                         set: { if $0 { workspace.groupSelection.insert(destination.id) } else { workspace.groupSelection.remove(destination.id) } }
                      ))
+        } else if compact {
+            HStack(spacing: CompactRouteLayout.iconSpacing) {
+                CompactRouteLayout.icon(outputIcon)
+                Text("\(destination.name) · unavailable")
+            }
+            .foregroundStyle(.secondary)
         } else {
-            Label(compact ? "\(destination.name) · unavailable" : destination.name,
-                  systemImage: outputIcon).foregroundStyle(.secondary)
+            Label(destination.name, systemImage: outputIcon).foregroundStyle(.secondary)
         }
     }
 
@@ -1400,7 +1405,7 @@ private struct RouteRow: View {
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .padding(.leading, 19)
+                .padding(.leading, CompactRouteLayout.titleInset)
             }
         }
         .padding(.vertical, 2)
@@ -1634,6 +1639,19 @@ private struct CompactPanelScroll<Content: View>: View {
     }
 }
 
+enum CompactRouteLayout {
+    static let captionWidth: CGFloat = 134
+    static let iconWidth: CGFloat = 18
+    static let iconSpacing: CGFloat = 6
+    static var titleInset: CGFloat { iconWidth + iconSpacing }
+
+    static func icon(_ symbol: String) -> some View {
+        Image(systemName: symbol)
+            .frame(width: iconWidth)
+            .accessibilityHidden(true)
+    }
+}
+
 struct VolumeSlider: View {
     let name: String
     @Binding var value: Double
@@ -1644,7 +1662,6 @@ struct VolumeSlider: View {
     var connection: ConnectionIcon? = nil
     var captionIcon: String? = nil
     var hidesCaption = false
-    static let compactCaptionWidth: CGFloat = 134
 
     @ViewBuilder private var slider: some View {
         if caption == nil && !hidesCaption {
@@ -1661,12 +1678,12 @@ struct VolumeSlider: View {
             if hidesCaption {
                 EmptyView()
             } else if let caption {
-                HStack(spacing: 4) {
-                    if let captionIcon { Image(systemName: captionIcon).accessibilityHidden(true) }
+                HStack(spacing: CompactRouteLayout.iconSpacing) {
+                    if let captionIcon { CompactRouteLayout.icon(captionIcon) }
                     Text(caption).lineLimit(1).truncationMode(.tail)
                     connection
                 }
-                    .frame(width: Self.compactCaptionWidth, alignment: .leading)
+                    .frame(width: CompactRouteLayout.captionWidth, alignment: .leading)
                     .help(caption)
             } else {
                 Image(systemName: "speaker.wave.2")

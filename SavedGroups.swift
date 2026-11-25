@@ -421,8 +421,8 @@ struct SavedGroupRow: View {
             Button {
                 expanded.toggle()
             } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "hifispeaker.2").accessibilityHidden(true)
+                HStack(spacing: CompactRouteLayout.iconSpacing) {
+                    CompactRouteLayout.icon("hifispeaker.2")
                     Text(group.name).lineLimit(1)
                     Image(systemName: expanded ? "chevron.down" : "chevron.right")
                         .font(.caption2).foregroundStyle(.secondary).accessibilityHidden(true)
@@ -435,7 +435,7 @@ struct SavedGroupRow: View {
             .buttonStyle(TextActionStyle())
             .accessibilityValue(expanded ? "Outputs expanded" : "Outputs collapsed")
             .help(expanded ? "Hide group outputs" : "Show group outputs")
-            .frame(width: VolumeSlider.compactCaptionWidth, alignment: .leading)
+            .frame(width: CompactRouteLayout.captionWidth, alignment: .leading)
             HStack(spacing: 8) {
                 volumeControl.opacity(active || recovering ? 1 : 0)
                     .disabled(!active && !recovering)
@@ -477,7 +477,7 @@ struct SavedGroupRow: View {
             if let error = session.error { Text(error) }
         }
         .font(.caption).foregroundStyle(.secondary)
-        .padding(.leading, 19)
+        .padding(.leading, CompactRouteLayout.titleInset)
     }
 
     private var compactMembers: some View {
@@ -519,7 +519,7 @@ struct SavedGroupRow: View {
             }
         }
         .font(.caption)
-        .padding(.leading, 19)
+        .padding(.leading, CompactRouteLayout.titleInset)
     }
 
     private var volumeControl: some View {
