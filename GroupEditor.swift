@@ -10,12 +10,10 @@ struct GroupEditor: View {
     @State private var name = ""
     @State private var members: Set<Receiver.ID> = []
     @State private var draftInputs: [GroupInput] = []
-    @State private var adding = false
 
     private var group: SpeakerGroup? { groups.groups.first { $0.id == groupID } }
     private var session: SynchronizedGroup? { groups.session(for: groupID) }
-    private var editingOutputs: Bool { session?.active != true && !workspace.recoveringGroups.contains(groupID) }
-    private var inputs: [GroupInput] { group?.configuredInputs ?? draftInputs }
+    private var editingOutputs: Bool { workspace.airPlay.runs[.saved(groupID)] == nil && session?.active != true }
     private var available: Set<Receiver.ID> {
         Set(workspace.destinations.compactMap { if case .airplay(let id) = $0 { id } else { nil } })
     }
@@ -24,13 +22,15 @@ struct GroupEditor: View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    Text(group == nil ? "Новая группа" : "Группа «\(group?.name ?? "")»")
+                    Text(group == nil ? "New Group" : "Edit \(group?.name ?? "")")
                         .font(.title2.weight(.semibold))
-                    TextField("Название", text: $name)
-                        .accessibilityLabel("Название группы")
-                    mixer
-                    Divider()
+                    TextField("Name", text: $name)
+                        .accessibilityLabel("Group Name")
                     outputChoices
+                    if group == nil {
+                        Divider()
+                        GroupSourceList(workspace: workspace, inputs: $draftInputs)
+                    }
                 }
                 .padding(18)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -38,7 +38,7 @@ struct GroupEditor: View {
             Divider()
             HStack {
                 if group != nil {
-                    Button("Удалить группу", role: .destructive) {
+                    Button("Delete Group", role: .destructive) {
                         groups.remove(groupID)
                         dismiss()
                     }
@@ -46,8 +46,8 @@ struct GroupEditor: View {
                     .disabled(!editingOutputs)
                 }
                 Spacer()
-                Button(group == nil ? "Отмена" : "Закрыть") { dismiss() }
-                Button(group == nil ? "Создать группу" : "Готово", action: save)
+                Button(group == nil ? "Cancel" : "Close") { dismiss() }
+                Button(group == nil ? "Create Group" : "Done", action: save)
                     .keyboardShortcut(.defaultAction)
                     .disabled(members.isEmpty || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
@@ -61,97 +61,11 @@ struct GroupEditor: View {
         }
     }
 
-    private var mixer: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack {
-                sectionTitle("Источники")
-                Spacer()
-                Button("Добавить источник…") { adding.toggle() }
-                    .buttonStyle(TextActionStyle(linkColor: true))
-                    .popover(isPresented: $adding, arrowEdge: .bottom) {
-                        GroupSourceChoices(workspace: workspace, included: Set(inputs.map(\.id))) { selected in
-                            apply(inputs + selected.map { GroupInput(source: $0, gain: 60) })
-                            adding = false
-                        }
-                    }
-            }
-            inputSection("Приложения", kind: .app)
-            Divider()
-            inputSection("Аудиоустройства", kind: .device)
-        }
-    }
-
-    private func inputSection(_ title: String, kind: SavedGroupSource.Kind) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            sectionTitle(title)
-            let selected = inputs.filter { $0.source.kind == kind }
-            if selected.isEmpty {
-                Text("Пока ничего не добавлено").font(.caption).foregroundStyle(.secondary)
-            }
-            ForEach(selected) { input in
-                inputRow(input)
-            }
-        }
-    }
-
-    private func inputRow(_ input: GroupInput) -> some View {
-        let status = session?.stream.mixStatus[input.id]
-        let running = session?.stream.active == true
-        let statusText = if input.muted { "Приглушён" }
-            else if let error = status?.error { error }
-            else if status?.hasSignal == true { "Есть сигнал" }
-            else if running { "Нет сигнала" }
-            else if input.source.choice(apps: workspace.apps, inputs: workspace.inputs) == nil { "Недоступен" }
-            else { "" }
-
-        return HStack(spacing: 9) {
-            SourceIdentityIcon(source: input.source, workspace: workspace)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(input.source.name).lineLimit(1).help(input.source.name)
-                if !statusText.isEmpty {
-                    Text(statusText).font(.caption).foregroundStyle(status?.hasSignal == true && !input.muted ? Color.green : .secondary)
-                        .lineLimit(1).help(statusText)
-                }
-            }
-            .frame(width: 129, alignment: .leading)
-            Slider(value: Binding(
-                get: { input.gain },
-                set: { value in update(input.id) { $0.gain = value.rounded() } }
-            ), in: 0...100) {
-                Text("Уровень \(input.source.name)")
-            }
-            .labelsHidden()
-            .accessibilityLabel("Уровень \(input.source.name)")
-            .disabled(input.muted)
-            Text("\(Int(input.gain.rounded()))%").monospacedDigit().frame(width: 40, alignment: .trailing)
-            Button {
-                update(input.id) { $0.muted.toggle() }
-            } label: {
-                Image(systemName: input.muted ? "speaker.slash" : "speaker.wave.2")
-            }
-            .accessibilityLabel(input.muted ? "Включить \(input.source.name)" : "Приглушить \(input.source.name)")
-            .help(input.muted ? "Включить" : "Приглушить")
-            Button {
-                apply(inputs.filter { $0.id != input.id })
-            } label: { Image(systemName: "xmark") }
-            .accessibilityLabel("Убрать \(input.source.name)")
-            .help("Убрать из группы")
-        }
-        .buttonStyle(.borderless)
-        .contextMenu {
-            if input.source.kind == .app {
-                Button(input.playLocally ? "Выключить звук приложения на Mac" : "Также на Mac") {
-                    update(input.id) { $0.playLocally.toggle() }
-                }
-            }
-        }
-    }
-
     private var outputChoices: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                sectionTitle("Выходы")
-                if !editingOutputs { Text("Состав можно изменить после остановки").font(.caption).foregroundStyle(.secondary) }
+                sectionTitle("Outputs")
+                if !editingOutputs { Text("Stop the group to change its outputs.").font(.caption).foregroundStyle(.secondary) }
             }
             let devices = available.union(members).sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
             ForEach(devices, id: \.self) { receiver in
@@ -161,30 +75,19 @@ struct GroupEditor: View {
                         if included { members.insert(receiver) } else { members.remove(receiver) }
                     }
                 )) {
-                    Label(receiver.name + (available.contains(receiver) ? "" : " · недоступна"), systemImage: "airplay.audio")
+                    Label(receiver.name + (available.contains(receiver) ? "" : " · unavailable"),
+                          systemImage: workspace.discovery.outputSymbol(for: receiver))
                 }
                 .toggleStyle(.checkbox)
                 .disabled(!editingOutputs)
             }
-            if devices.isEmpty { Text("Поиск AirPlay-выходов…").font(.caption).foregroundStyle(.secondary) }
+            if devices.isEmpty { Text("Searching for AirPlay outputs…").font(.caption).foregroundStyle(.secondary) }
         }
     }
 
     private func sectionTitle(_ title: String) -> some View {
         Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             .accessibilityAddTraits(.isHeader)
-    }
-
-    private func apply(_ updated: [GroupInput]) {
-        if group == nil { draftInputs = updated }
-        else { workspace.updateGroupInputs(updated, in: groupID) }
-    }
-
-    private func update(_ id: String, _ change: (inout GroupInput) -> Void) {
-        var updated = inputs
-        guard let index = updated.firstIndex(where: { $0.id == id }) else { return }
-        change(&updated[index])
-        apply(updated)
     }
 
     private func save() {
@@ -194,6 +97,160 @@ struct GroupEditor: View {
         if group == nil { saved.setInputs(draftInputs) }
         groups.save(saved)
         dismiss()
+    }
+}
+
+@MainActor
+struct GroupSourcesWindow: View {
+    let groupID: UUID
+    @ObservedObject var workspace: RoutingWorkspace
+    @ObservedObject var groups: SpeakerGroups
+    @Environment(\.dismiss) private var dismiss
+
+    private var group: SpeakerGroup? { groups.groups.first { $0.id == groupID } }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if let group {
+                Text("Sources for \(group.name)")
+                    .font(.title2.weight(.semibold))
+                    .padding([.top, .horizontal], 18)
+                ScrollView {
+                    let stream = groups.session(for: groupID)?.stream
+                    GroupSourceList(workspace: workspace, inputs: Binding(
+                        get: { self.group?.configuredInputs ?? [] },
+                        set: { workspace.updateGroupInputs($0, in: groupID) }
+                    ), statuses: stream?.mixStatus ?? [:], running: stream?.active == true)
+                    .padding(18)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } else {
+                Text("Group unavailable")
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+            Divider()
+            HStack {
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(14)
+        }
+        .frame(minWidth: 465, minHeight: 260)
+        .task { workspace.start() }
+    }
+}
+
+@MainActor
+private struct GroupSourceList: View {
+    @ObservedObject var workspace: RoutingWorkspace
+    @Binding var inputs: [GroupInput]
+    var statuses: [String: MixInputStatus] = [:]
+    var running = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            inputSection("Apps", kind: .app, available: workspace.apps.map {
+                SavedGroupSource(kind: .app, identifier: $0.bundleID ?? $0.name, name: $0.name)
+            })
+            Divider()
+            inputSection("Audio Devices", kind: .device, available: workspace.inputs.map {
+                SavedGroupSource(kind: .device, identifier: $0.uid, name: $0.name)
+            })
+        }
+    }
+
+    private func inputSection(_ title: String, kind: SavedGroupSource.Kind,
+                              available: [SavedGroupSource]) -> some View {
+        var seen = Set<String>()
+        let configured = inputs.map(\.source).filter { $0.kind == kind }
+        let sources = (configured + available).filter { seen.insert($0.id).inserted }.sorted {
+            let order = $0.name.localizedStandardCompare($1.name)
+            return order == .orderedSame ? $0.id < $1.id : order == .orderedAscending
+        }
+        return VStack(alignment: .leading, spacing: 6) {
+            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                .accessibilityAddTraits(.isHeader)
+            if sources.isEmpty {
+                Text("No sources available").font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(sources) { source in
+                inputRow(source, input: inputs.first { $0.id == source.id })
+            }
+        }
+    }
+
+    private func inputRow(_ source: SavedGroupSource, input: GroupInput?) -> some View {
+        let status = statuses[source.id]
+        let statusText = if input?.muted == true { "Muted" }
+            else if let error = status?.error { error }
+            else if status?.hasSignal == true { "Signal detected" }
+            else if source.choice(apps: workspace.apps, inputs: workspace.inputs) == nil { "Unavailable" }
+            else if running && input != nil { "No signal" }
+            else { "" }
+
+        return HStack(spacing: 10) {
+            Toggle(isOn: Binding(
+                get: { inputs.contains { $0.id == source.id } },
+                set: { enabled in
+                    if enabled {
+                        guard !inputs.contains(where: { $0.id == source.id }) else { return }
+                        inputs.append(GroupInput(source: source, gain: 60))
+                    } else {
+                        inputs.removeAll { $0.id == source.id }
+                    }
+                }
+            )) {
+                HStack(spacing: 7) {
+                    SourceIdentityIcon(source: source, workspace: workspace)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(source.name).lineLimit(1).help(source.name)
+                        if !statusText.isEmpty {
+                            Text(statusText).font(.caption)
+                                .foregroundStyle(status?.hasSignal == true && input?.muted == false ? Color.green : .secondary)
+                                .lineLimit(1).help(statusText)
+                        }
+                    }
+                }
+            }
+            .toggleStyle(.checkbox)
+            .frame(width: input == nil ? nil : 180, alignment: .leading)
+            if let input {
+                Slider(value: Binding(
+                    get: { input.gain },
+                    set: { value in update(input.id) { $0.gain = value.rounded() } }
+                ), in: 0...100) {
+                    Text("\(source.name) level")
+                }
+                .labelsHidden()
+                .accessibilityLabel("\(source.name) level")
+                .disabled(input.muted)
+                Text("\(Int(input.gain.rounded()))%").monospacedDigit().frame(width: 40, alignment: .trailing)
+                Button {
+                    update(input.id) { $0.muted.toggle() }
+                } label: {
+                    Image(systemName: input.muted ? "speaker.slash" : "speaker.wave.2")
+                }
+                .accessibilityLabel(input.muted ? "Unmute \(source.name)" : "Mute \(source.name)")
+                .help(input.muted ? "Unmute" : "Mute")
+            }
+        }
+        .buttonStyle(.borderless)
+        .contextMenu {
+            if let input, source.kind == .app {
+                Button(input.playLocally ? "Stop Playing on This Mac" : "Also Play on This Mac") {
+                    update(input.id) { $0.playLocally.toggle() }
+                }
+            }
+        }
+    }
+
+    private func update(_ id: String, _ change: (inout GroupInput) -> Void) {
+        var updated = inputs
+        guard let index = updated.firstIndex(where: { $0.id == id }) else { return }
+        change(&updated[index])
+        inputs = updated
     }
 }
 
@@ -224,73 +281,5 @@ struct SourceIdentityIcon: View {
         }
         .frame(width: 19, height: 19)
         .accessibilityHidden(true)
-    }
-}
-
-@MainActor
-private struct GroupSourceChoices: View {
-    @ObservedObject var workspace: RoutingWorkspace
-    let included: Set<String>
-    let add: ([SavedGroupSource]) -> Void
-    @Environment(\.dismiss) private var dismiss
-    @State private var selected = Set<String>()
-
-    private var apps: [SavedGroupSource] {
-        var seen = Set<String>()
-        return workspace.apps.compactMap { app in
-            let source = SavedGroupSource(kind: .app, identifier: app.bundleID ?? app.name, name: app.name)
-            return seen.insert(source.id).inserted ? source : nil
-        }
-    }
-
-    private var devices: [SavedGroupSource] {
-        workspace.inputs.map { SavedGroupSource(kind: .device, identifier: $0.uid, name: $0.name) }
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 5) {
-                    choices("Приложения", sources: apps)
-                    Divider()
-                    choices("Аудиоустройства", sources: devices)
-                }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            Divider()
-            HStack {
-                Spacer()
-                Button("Отмена") { dismiss() }
-                Button("Добавить") { add((apps + devices).filter { selected.contains($0.id) }) }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(selected.isEmpty)
-            }
-            .padding(10)
-        }
-        .frame(width: 340, height: 365)
-    }
-
-    private func choices(_ title: String, sources: [SavedGroupSource]) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-            ForEach(sources) { source in
-                let alreadyAdded = included.contains(source.id)
-                Toggle(isOn: Binding(
-                    get: { alreadyAdded || selected.contains(source.id) },
-                    set: { checked in
-                        if checked { selected.insert(source.id) } else { selected.remove(source.id) }
-                    }
-                )) {
-                    HStack(spacing: 7) {
-                        SourceIdentityIcon(source: source, workspace: workspace)
-                        Text(source.name).lineLimit(1)
-                        if alreadyAdded { Text("Добавлен").font(.caption).foregroundStyle(.secondary) }
-                    }
-                }
-                .toggleStyle(.checkbox)
-                .disabled(alreadyAdded)
-            }
-        }
     }
 }

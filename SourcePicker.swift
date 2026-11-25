@@ -27,7 +27,7 @@ struct RouteSourcePicker: View {
             showing.toggle()
         } label: {
             HStack(spacing: 7) {
-                Text(compact && selection == nil ? (unavailableName ?? "Выбрать источник…") : selectedName)
+                Text(compact && selection == nil ? (unavailableName ?? "Choose Source…") : selectedName)
                     .lineLimit(1)
                 if !compact {
                     Image(systemName: "chevron.up.chevron.down").imageScale(.small)
@@ -44,9 +44,9 @@ struct RouteSourcePicker: View {
 
     private var selectedName: String {
         switch selection {
-        case .application(let pid): apps.first(where: { $0.id == pid })?.name ?? "Приложение закрыто"
-        case .device(let id): inputs.first(where: { $0.id == id })?.name ?? "Устройство недоступно"
-        case nil: unavailableName ?? "Выбрать"
+        case .application(let pid): apps.first(where: { $0.id == pid })?.name ?? "App is closed"
+        case .device(let id): inputs.first(where: { $0.id == id })?.name ?? "Device unavailable"
+        case nil: unavailableName ?? "Choose"
         }
     }
 }
@@ -146,24 +146,24 @@ private struct SourceChoices: View {
         VStack(alignment: .leading, spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 2) {
-                    choice("Выбрать", nil)
-                    section("Приложения")
+                    choice("Choose", nil)
+                    section("Apps")
                     ForEach(apps) { app in
                         let signal = playing.contains(app.id)
                         choice(app.name, .application(app.id),
                                icon: signal ? "speaker.wave.2.fill" : app.hasActiveOutput ? "speaker.fill" : nil,
                                signal: signal,
-                               value: signal ? "Идёт звук" : app.hasActiveOutput ? "Аудиовыход открыт" : "")
+                               value: signal ? "Playing audio" : app.hasActiveOutput ? "Audio output open" : "")
                     }
-                    section("Аудиоустройства")
+                    section("Audio Devices")
                     ForEach(inputs) { input in choice(input.name, .device(input.id)) }
                 }
                 .padding(10)
             }
             Divider()
             HStack(spacing: 15) {
-                Label("Открыт выход", systemImage: "speaker.fill")
-                Label("Идёт звук", systemImage: "speaker.wave.2.fill")
+                Label("Output Open", systemImage: "speaker.fill")
+                Label("Playing audio", systemImage: "speaker.wave.2.fill")
             }
             .font(.caption)
             .foregroundStyle(.secondary)

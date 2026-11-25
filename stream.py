@@ -36,7 +36,7 @@ class Stop(Exception):
 
 class LocalAirPlayReceiver(RuntimeError):
     def __init__(self):
-        super().__init__('Это текущий Mac. Для звука приложения на нём включи «Также на Mac».')
+        super().__init__('This is your Mac. To hear the app here, turn on “Also Play on This Mac”.')
 
 
 def clock_exists():
@@ -91,7 +91,7 @@ def resolve_bonjour(name):
         except subprocess.TimeoutExpired:
             browse.kill()
             browse.communicate()
-    raise RuntimeError(f'Не удалось определить адрес {name}')
+    raise RuntimeError(f'Could not resolve the address for {name}')
 
 
 def device_id(value):
@@ -125,7 +125,7 @@ def route_context(host):
     route = subprocess.check_output(['/sbin/route', '-n', 'get', host], text=True, stderr=subprocess.DEVNULL)
     interface = re.search(r'^\s*interface:\s+(\S+)', route, re.M)
     if not interface:
-        raise RuntimeError('Сетевой интерфейс для AirPlay не найден')
+        raise RuntimeError('No network interface found for AirPlay')
     if interface[1] == 'lo0':
         raise LocalAirPlayReceiver()
     address = subprocess.check_output(['/usr/sbin/ipconfig', 'getifaddr', interface[1]], text=True).strip()
@@ -203,18 +203,18 @@ def sonos_transport_state(host):
 
 def sonos_block(host, state):
     if not state:
-        return 'unknown', 'не удалось проверить, свободна ли Sonos'
+        return 'unknown', 'Could not check Sonos availability'
     try:
         uri = (sonos_transport_value(host, 'GetMediaInfo', 'CurrentURI') or '').lower()
     except (OSError, ValueError, ET.ParseError):
         uri = ''
     if uri.startswith('x-sonos-htastream:'):
-        return 'tv', 'занят ТВ-вход'
+        return 'tv', 'TV input in use'
     if ':airplay:' in uri:
-        return 'airplay', 'занята другим потоком AirPlay'
+        return 'airplay', 'In use by another AirPlay stream'
     if state == 'PAUSED_PLAYBACK':
-        return 'paused', 'другой источник на паузе'
-    return 'other', 'занята другим источником'
+        return 'paused', 'Another source is paused'
+    return 'other', 'In use by another source'
 
 
 def check_sonos(host):
@@ -308,11 +308,11 @@ def wait_for_clock(daemon, heartbeat, parent):
     while not clock_exists():
         heartbeat.touch()
         if daemon.poll() is not None:
-            raise RuntimeError('Не удалось запустить PTP: ' + daemon.stderr.read().strip())
+            raise RuntimeError('Could not start PTP: ' + daemon.stderr.read().strip())
         if stop_requested or os.getppid() != parent:
             raise Stop()
         if time.monotonic() >= deadline:
-            raise RuntimeError('Истекло время подтверждения PTP')
+            raise RuntimeError('Timed out waiting for PTP confirmation')
         time.sleep(.15)
 
 
@@ -330,7 +330,16 @@ def stop_clock(daemon, stop):
 def main(args):
     binary = Path(args.transport).resolve()
     if hashlib.sha256(binary.read_bytes()).hexdigest() != PINNED_SHA256:
-        raise RuntimeError('Контрольная сумма AirPlay-передатчика не совпадает')
+        raise RuntimeError('AirPlay sender checksum did not match')
+    if getattr(args, 'probe_sonos', None):
+        host, _, txt = resolve(args.probe_sonos)
+        if 'manufacturer=sonos' not in txt.casefold().split():
+            publish('occupation', category='not_sonos')
+        else:
+            block = check_sonos(host)
+            publish('occupation', category=block[0] if block else 'available',
+                    message=block[1] if block else '')
+        return
     if args.check:
         if clock_exists():
             print('An AirPlay PTP clock is already running')
@@ -347,15 +356,15 @@ def main(args):
     if not endpoints:
         raise LocalAirPlayReceiver()
     if len(networks) != 1:
-        raise RuntimeError('AirPlay-устройства доступны через разные интерфейсы')
+        raise RuntimeError('The AirPlay devices are on different network interfaces')
     _, address = networks.pop()
     if args.use_shared_clock:
         if args.clock_address != address:
-            raise RuntimeError('Выход доступен через другой сетевой интерфейс PTP')
+            raise RuntimeError('The output uses a different network interface from PTP')
         if not clock_exists():
-            raise RuntimeError('Общий PTP-процесс недоступен')
+            raise RuntimeError('The shared PTP process is unavailable')
     elif clock_exists():
-        raise RuntimeError('Общий PTP-процесс уже запущен')
+        raise RuntimeError('The shared PTP process is already running')
     if not args.clock_only:
         volume_file = Path(args.volumes)
         volumes = json.loads(volume_file.read_text())
@@ -382,7 +391,7 @@ def main(args):
                     heartbeat.touch()
                     if select.select([0], [], [], 0.5)[0] and not os.read(0, 1024):
                         raise Stop()
-                raise RuntimeError('PTP-процесс завершился')
+                raise RuntimeError('The PTP process exited')
 
             skipped = {}
             tv_skips = set()
@@ -426,7 +435,7 @@ def main(args):
                 if endpoint is None:
                     endpoint = resolve(name)
                     if route_context(endpoint[0])[1] != address:
-                        raise RuntimeError('Выход доступен через другой сетевой интерфейс PTP')
+                        raise RuntimeError('The output uses a different network interface from PTP')
                 host, _, txt = endpoint
                 block = check_sonos(host) if args.protect_sonos and 'manufacturer=sonos' in txt.casefold().split() else None
                 return endpoint, block
@@ -468,13 +477,16 @@ def main(args):
                         else:
                             tv_skips.add(name)
                             publish('receiver_skipped', receiver=name, message=failure, category='tv')
+                    if failure:
+                        if session.get('recovering'):
+                            publish('receiver_released', receiver=name)
                     else:
                         publish('receiver_stopped', receiver=name)
                 if daemon is not None and time.monotonic() >= next_heartbeat:
                     heartbeat.touch()
                     next_heartbeat = time.monotonic() + 1
                 if (daemon is not None and daemon.poll() is not None) or not clock_exists():
-                    raise RuntimeError('PTP-процесс завершился')
+                    raise RuntimeError('The PTP process exited')
                 if time.monotonic() >= next_volume:
                     new_volumes = json.loads(volume_file.read_text())
                     for name, (retry_at, retry_until) in list(pending_connects.items()):
@@ -505,7 +517,8 @@ def main(args):
                                                           new_volumes[name], folder, f'retry-{names.index(name)}')
                         except OSError as error:
                             failed_receivers.add(name)
-                            publish('receiver_failed', receiver=name, message='не удалось открыть AirPlay', diagnostic=str(error))
+                            publish('receiver_failed', receiver=name, message='Could not open AirPlay', diagnostic=str(error))
+                            publish('receiver_released', receiver=name)
                             if not sessions and not pending_connects:
                                 raise
                             continue
@@ -520,17 +533,21 @@ def main(args):
                                 continue
                             seen_joins.add(token)
                             transfer = token.startswith('transfer:')
+                            override_tv = token.startswith('tv:')
                             recovering = token.startswith('recover:')
-                            eligible = transfer or name in (failed_receivers if recovering else tv_skips)
-                            if eligible and name in new_volumes and name not in sessions:
-                                probes[name] = (joining.submit(probe_receiver, name, endpoints.get(name)), recovering or transfer)
+                            eligible = transfer or override_tv or name in (failed_receivers if recovering else tv_skips)
+                            if name not in new_volumes:
+                                publish('receiver_released', receiver=name)
+                            elif eligible and name not in sessions:
+                                probes[name] = (joining.submit(probe_receiver, name, endpoints.get(name)), recovering or transfer, override_tv)
                             else:
-                                publish('receiver_skipped', receiver=name, message='недоступна для подключения', category='unknown')
-                    for name, (future, recovering) in list(probes.items()):
+                                publish('receiver_skipped', receiver=name, message='Unavailable for connection', category='unknown')
+                    for name, (future, recovering, override_tv) in list(probes.items()):
                         if not future.done():
                             continue
                         del probes[name]
                         if name not in new_volumes:
+                            publish('receiver_released', receiver=name)
                             continue
                         try:
                             endpoint, block = future.result()
@@ -539,20 +556,18 @@ def main(args):
                             continue
                         except (OSError, RuntimeError, subprocess.SubprocessError) as error:
                             failed_receivers.add(name)
-                            publish('receiver_failed', receiver=name, message='не удалось найти выход AirPlay',
+                            publish('receiver_failed', receiver=name, message='Could not find the AirPlay output',
                                     diagnostic=str(error))
+                            publish('receiver_released', receiver=name)
                             continue
                         endpoints[name] = endpoint
-                        if block and (recovering or block[0] != 'tv'):
-                            if recovering and block[0] != 'tv':
-                                publish('receiver_failed', receiver=name, message=block[1])
+                        if block and (block[0] != 'tv' or (recovering and not override_tv)):
+                            if block[0] == 'tv':
+                                failed_receivers.discard(name)
+                                tv_skips.add(name)
                             else:
-                                if block[0] == 'tv':
-                                    failed_receivers.discard(name)
-                                    tv_skips.add(name)
-                                else:
-                                    tv_skips.discard(name)
-                                publish('receiver_skipped', receiver=name, message=block[1], category=block[0])
+                                tv_skips.discard(name)
+                            publish('receiver_skipped', receiver=name, message=block[1], category=block[0])
                             continue
                         try:
                             next_join += 1
@@ -561,9 +576,10 @@ def main(args):
                         except OSError as exc:
                             if recovering:
                                 failed_receivers.add(name)
-                                publish('receiver_failed', receiver=name, message='не удалось заново открыть AirPlay', diagnostic=str(exc))
+                                publish('receiver_failed', receiver=name, message='Could not reopen AirPlay', diagnostic=str(exc))
                             else:
-                                publish('receiver_skipped', receiver=name, message=str(exc), category='tv')
+                                publish('receiver_failed', receiver=name, message=str(exc))
+                            publish('receiver_released', receiver=name)
                             continue
                         fresh['late'] = {'deadline': time.monotonic() + 16}
                         fresh['recovering'] = recovering
@@ -598,7 +614,7 @@ def main(args):
                     exited = s['child'].poll() is not None
                     if exited and not late:
                         if s.get('joined'):
-                            retire(name, 'подключённая колонка отключилась')
+                            retire(name, 'The output disconnected')
                             continue
                         confirmed = name in connected or any(line.startswith('[STATUS] connected') for line in s['statuses'])
                         if (not confirmed and name not in retried and
@@ -610,8 +626,8 @@ def main(args):
                             pending_connects[name] = (now + CONNECT_RETRY_DELAY, now + CONNECT_RETRY_WINDOW)
                             publish('receiver_retry', receiver=name, diagnostic=' | '.join(s['diagnostics']))
                             continue
-                        reason = ('соединение AirPlay прервалось' if confirmed
-                                  else 'не удалось подключиться по AirPlay')
+                        reason = ('The AirPlay connection dropped' if confirmed
+                                  else 'Could not connect over AirPlay')
                         fail_receiver(name, reason)
                         continue
                     statuses = '\n'.join(s['statuses'])
@@ -627,13 +643,13 @@ def main(args):
                         ack = re.search(r'^\[STATUS\] started .*?\bat_unix_ms=(\d+)', statuses, re.M)
                         if (exited or stalled or time.monotonic() >= late['deadline'] or
                             (ack and int(ack[1]) != late.get('start'))):
-                            retire(name, 'не удалось подключиться синхронно')
+                            retire(name, 'Could not join synchronized playback')
                             continue
                         if 'start' in late and '[STATUS] audio buffered_ms=' in statuses and not late.get('sent'):
                             try:
                                 command(s, f'TITLE=Room Audio\nSTART_JOIN=1\nSTART_UNIX_MS={late["start"]}\nACTION=START\n')
                             except OSError:
-                                retire(name, 'не удалось запустить синхронную передачу')
+                                retire(name, 'Could not start synchronized streaming')
                                 continue
                             late['sent'] = True
                         if ack and ready and late.get('playing'):
@@ -647,7 +663,7 @@ def main(args):
                         connected.add(name)
                         publish('connected', receiver=name)
                     if stalled:
-                        fail_receiver(name, 'не удалось синхронизировать часы AirPlay')
+                        fail_receiver(name, 'Could not synchronize the AirPlay clock')
                         continue
                     if any(line.startswith('[STATUS] playing ') for line in lines) and name not in playing:
                         playing.add(name)
@@ -661,7 +677,7 @@ def main(args):
                         try:
                             command(s, f'TITLE=Room Audio\nSTART_UNIX_MS={anchor}\nACTION=START\n')
                         except OSError:
-                            fail_receiver(name, 'не удалось запустить передачу AirPlay')
+                            fail_receiver(name, 'Could not start AirPlay streaming')
                 clocks_ready = all(any('state=ready' in line for line in s['statuses']) for s in sessions.values())
                 if anchor and len(playing) == len(sessions) and clocks_ready and deadline is not None:
                     starts = [re.search(r'^\[STATUS\] started .*?\bat_unix_ms=(\d+)', '\n'.join(s['statuses']), re.M) for s in sessions.values()]
@@ -669,9 +685,9 @@ def main(args):
                         publish('streaming', anchor=str(anchor))
                         deadline = None
                     elif all(starts):
-                        raise RuntimeError('AirPlay-устройства подтвердили разное время старта')
+                        raise RuntimeError('The AirPlay devices confirmed different start times')
                 if deadline is not None and time.monotonic() >= deadline:
-                    raise RuntimeError('Истекло время запуска AirPlay')
+                    raise RuntimeError('Timed out starting AirPlay')
                 read, writes, _ = select.select([0], [s['fd'] for s in sessions.values() if s['queue']], [], .08)
                 if read:
                     chunk = os.read(0, 16384)
@@ -687,9 +703,9 @@ def main(args):
                             s['queue'].extend(chunk)
                         if len(s['queue']) > args.sample_rate * 4 * 6:
                             if late or s.get('joined'):
-                                retire(name, 'переполнилась очередь звука')
+                                retire(name, 'The audio queue overflowed')
                             else:
-                                fail_receiver(name, 'переполнилась очередь звука')
+                                fail_receiver(name, 'The audio queue overflowed')
                     received += len(chunk)
                 for name, s in list(sessions.items()):
                     if s['fd'] in writes:
@@ -699,9 +715,9 @@ def main(args):
                             pass
                         except BrokenPipeError:
                             if s.get('late') or s.get('joined'):
-                                retire(name, 'AirPlay-сессия закрылась')
+                                retire(name, 'The AirPlay session closed')
                             else:
-                                fail_receiver(name, 'AirPlay-сессия закрылась')
+                                fail_receiver(name, 'The AirPlay session closed')
         finally:
             try:
                 for session in sessions.values():
@@ -719,6 +735,7 @@ if __name__ == '__main__':
     parser.add_argument('--transport', required=True)
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--clock-only', action='store_true')
+    parser.add_argument('--probe-sonos')
     parser.add_argument('--use-shared-clock', action='store_true')
     parser.add_argument('--clock-address')
     parser.add_argument('--protect-sonos', action='store_true')
@@ -728,7 +745,7 @@ if __name__ == '__main__':
     parser.add_argument('--sample-rate', type=int, choices=(44100, 48000), default=44100)
     parser.add_argument('receivers', nargs='*')
     args = parser.parse_args()
-    if not args.check and (not args.receivers or (not args.clock_only and not args.volumes)):
+    if not args.check and not args.probe_sonos and (not args.receivers or (not args.clock_only and not args.volumes)):
         parser.error('receiver names and a volume file are required')
     if args.override_tv and (not args.protect_sonos or not set(args.override_tv).issubset(args.receivers)):
         parser.error('TV override requires a protected, named receiver')
@@ -744,6 +761,9 @@ if __name__ == '__main__':
         main(args)
     except Stop:
         publish('stopped')
+    except LocalAirPlayReceiver as exc:
+        publish('error', message=str(exc), category='local')
+        raise SystemExit(1)
     except Exception as exc:
         publish('error', message=str(exc))
         raise SystemExit(1)

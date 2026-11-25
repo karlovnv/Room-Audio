@@ -54,14 +54,14 @@ final class Capture {
         guard supported,
               format.mFormatID == kAudioFormatLinearPCM, format.mBitsPerChannel == 32,
               format.mFormatFlags & kAudioFormatFlagIsFloat != 0 else {
-            throw StreamError(mixInput == nil ? "Требуется стереовход 44,1 или 48 кГц Float32." : "Неподдерживаемый формат аудиовхода.")
+            throw StreamError(mixInput == nil ? "A 44.1 or 48 kHz Float32 stereo input is required." : "Unsupported audio input format.")
         }
         sampleRate = Int(format.mSampleRate)
         if let fd {
             let flags = fcntl(fd, F_GETFL)
             guard flags >= 0, fcntl(fd, F_SETNOSIGPIPE, 1) >= 0,
                   fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0 else {
-                throw StreamError("Не удалось открыть канал аудиопотока")
+                throw StreamError("Could not open the audio stream pipe")
             }
         }
         pcm = .allocate(capacity: 256)
@@ -126,7 +126,7 @@ final class Capture {
     }
 
     private static func check(_ status: OSStatus) throws {
-        guard status == noErr else { throw StreamError("Core Audio: \(status)") }
+        guard status == noErr else { throw AudioCaptureError(status: status, operation: "Could not open the audio input") }
     }
 }
 
@@ -142,7 +142,7 @@ extension Capture {
             return (try Capture(id: tap.device, fd: fd, tapFormat: tap.format,
                                 localOutput: localOutput, mixInput: mixInput), tap)
         case .mix:
-            throw StreamError("Микшер доступен для сохранённых групп.")
+            throw StreamError("The mixer is available for saved groups.")
         }
     }
 }
@@ -153,6 +153,18 @@ struct StreamError: LocalizedError {
     var errorDescription: String? { message }
 }
 
+struct LocalAirPlayOutputError: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+struct AirPlayReceipt: Equatable {
+    var playing = false
+    var released = false
+    var category: String?
+    var failure: String?
+}
+
 @MainActor
 final class Streaming: ObservableObject {
     private let logger = Logger(subsystem: "local.roomaudio.discovery", category: "AirPlay")
@@ -160,7 +172,7 @@ final class Streaming: ObservableObject {
     @Published private(set) var stopping = false
     @Published private(set) var isTransmitting = false
     private(set) var scheduledStart: String?
-    @Published private(set) var status = "Готово к запуску"
+    @Published private(set) var status = "Ready"
     @Published private(set) var receivers: [String: String] = [:]
     @Published private(set) var skippedReceivers: [String: String] = [:]
     @Published private(set) var receiversBlockedByTV: Set<String> = []
@@ -181,9 +193,10 @@ final class Streaming: ObservableObject {
     private var joinsFile: URL?
     private var joinRequests: [String: String] = [:]
     private var currentVolumes: [String: Int] = [:]
+    private(set) var airPlayReceipts: [String: AirPlayReceipt] = [:]
 
     private static func awaitingPlayback(_ status: String) -> Bool {
-        status == "Подключение" || status == "Синхронизация"
+        status == "Connecting" || status == "Synchronizing"
     }
 
     private static func connectionActive(_ active: Bool, _ stopping: Bool, _ transmitting: Bool,
@@ -204,14 +217,21 @@ final class Streaming: ObservableObject {
 
     func isConnecting(to receiver: String) -> Bool {
         guard active, !stopping, let state = receivers[receiver] else { return false }
-        return Self.awaitingPlayback(state) || (!isTransmitting && (state == "Ожидание" || state == "Передача"))
+        return Self.awaitingPlayback(state) || (!isTransmitting && (state == "Waiting" || state == "Streaming"))
     }
 
     func prepareReceivers(_ names: [String]) {
-        receivers = Dictionary(uniqueKeysWithValues: names.map { ($0, "Ожидание") })
+        airPlayReceipts = Dictionary(uniqueKeysWithValues: names.map { ($0, AirPlayReceipt()) })
+        receivers = Dictionary(uniqueKeysWithValues: names.map { ($0, "Waiting") })
         skippedReceivers = [:]
         receiversBlockedByTV = []
         failedReceivers = []
+    }
+
+    func markLocalAirPlay(_ names: [String], message: String) {
+        for name in names {
+            airPlayReceipts[name] = AirPlayReceipt(released: true, category: "local", failure: message)
+        }
     }
 
     func start(input: AudioObjectID, names: [String], volumes: [String: Int]) {
@@ -225,7 +245,7 @@ final class Streaming: ObservableObject {
         do {
             guard let script = Bundle.main.url(forResource: "stream", withExtension: "py"),
                   let transport = Bundle.main.url(forResource: "cliairplay", withExtension: nil) else {
-                throw StreamError("Компоненты AirPlay отсутствуют в приложении")
+                throw StreamError("AirPlay components are missing from the app")
             }
             let folder = FileManager.default.temporaryDirectory.appendingPathComponent("room-audio-\(UUID())")
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false,
@@ -286,7 +306,7 @@ final class Streaming: ObservableObject {
             self.currentVolumes = volumes
             active = true
             stopping = false
-            status = "Подготовка AirPlay…"
+            status = "Preparing AirPlay…"
             Task { await monitor(process: process, folder: folder) }
         } catch {
             status = error.localizedDescription
@@ -295,7 +315,7 @@ final class Streaming: ObservableObject {
 
     func start(source: AudioSource, output: LocalOutput, volume: Int) {
         guard !active else { return }
-        receivers = [output.name: "Подключение"]
+        receivers = [output.name: "Connecting"]
         do {
             let player = try LocalPlayback(device: output)
             player.level.store(volume, ordering: .relaxed)
@@ -308,11 +328,11 @@ final class Streaming: ObservableObject {
             bluetoothName = output.name
             active = true
             isTransmitting = true
-            receivers[output.name] = "Передача"
-            status = "Передача по Bluetooth"
+            receivers[output.name] = "Streaming"
+            status = "Streaming over Bluetooth"
             Task { await monitorBluetooth(output, player: player) }
         } catch {
-            receivers[output.name] = "Отключено"
+            receivers[output.name] = "Disconnected"
             status = error.localizedDescription
         }
     }
@@ -330,11 +350,11 @@ final class Streaming: ObservableObject {
         while bluetooth === player {
             updateMeter()
             if capture?.failed.load(ordering: .relaxed) == true {
-                finishBluetooth(error: "Переполнился буфер Bluetooth.")
+                finishBluetooth(error: "The Bluetooth buffer overflowed.")
                 break
             }
             if ticks % 10 == 0, let connected = try? LocalOutput.list(), !connected.contains(output) {
-                finishBluetooth(error: "Bluetooth-устройство отключилось.")
+                finishBluetooth(error: "The Bluetooth device disconnected.")
                 break
             }
             ticks += 1
@@ -348,10 +368,10 @@ final class Streaming: ObservableObject {
         capture = nil
         appTap = nil
         bluetooth = nil
-        if let bluetoothName { receivers[bluetoothName] = error == nil ? "Остановлено" : "Отключено" }
+        if let bluetoothName { receivers[bluetoothName] = error == nil ? "Stopped" : "Disconnected" }
         bluetoothName = nil
         clearSignal()
-        status = error ?? "Передача остановлена"
+        status = error ?? "Streaming stopped"
         active = false
         isTransmitting = false
     }
@@ -396,7 +416,7 @@ final class Streaming: ObservableObject {
         do {
             try JSONEncoder().encode(updated).write(to: volumesFile, options: .atomic)
             currentVolumes = updated
-        } catch { status = "Не удалось задать громкость: \(error.localizedDescription)" }
+        } catch { status = "Could not set the volume: \(error.localizedDescription)" }
     }
 
     func stopReceiver(_ receiver: String) {
@@ -407,9 +427,9 @@ final class Streaming: ObservableObject {
         do {
             try JSONEncoder().encode(remaining).write(to: volumesFile, options: .atomic)
             currentVolumes = remaining
-            receivers[receiver] = "Остановка…"
+            receivers[receiver] = "Stopping…"
         } catch {
-            status = "Не удалось остановить выход: \(error.localizedDescription)"
+            status = "Could not stop the output: \(error.localizedDescription)"
         }
     }
 
@@ -423,9 +443,10 @@ final class Streaming: ObservableObject {
         _ = requestJoin(receiver, volume: volume, token: "recover:\(UUID())")
     }
 
-    func joinTransferredReceiver(_ receiver: String, volume: Int) -> Bool {
+    func joinAuthorizedReceiver(_ receiver: String, volume: Int, operationID: UUID, overrideTV: Bool) -> Bool {
         guard currentVolumes[receiver] == nil else { return false }
-        return requestJoin(receiver, volume: volume, token: "transfer:\(UUID())")
+        let mode = overrideTV ? "tv" : "transfer"
+        return requestJoin(receiver, volume: volume, token: "\(mode):\(operationID)")
     }
 
     private func requestJoin(_ receiver: String, volume: Int, token: String) -> Bool {
@@ -447,10 +468,11 @@ final class Streaming: ObservableObject {
             receiversBlockedByTV.remove(receiver)
             failedReceivers.remove(receiver)
             skippedReceivers.removeValue(forKey: receiver)
-            receivers[receiver] = "Подключение"
+            receivers[receiver] = "Connecting"
+            airPlayReceipts[receiver] = AirPlayReceipt()
             return true
         } catch {
-            status = "Не удалось подключить выход: \(error.localizedDescription)"
+            status = "Could not connect the output: \(error.localizedDescription)"
             return false
         }
     }
@@ -462,7 +484,7 @@ final class Streaming: ObservableObject {
             return
         }
         stopping = true
-        status = "Остановка…"
+        status = "Stopping…"
         shutdown()
     }
 
@@ -484,15 +506,29 @@ final class Streaming: ObservableObject {
                 pending.removeSubrange(...newline)
                 guard let event = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: String],
                       let kind = event["status"] else { continue }
-                if kind == "error" { terminalError = event["message"] ?? "Ошибка AirPlay" }
+                if kind == "error" { terminalError = event["message"] ?? "AirPlay error" }
+                if let name = event["receiver"] {
+                    switch kind {
+                    case "playing":
+                        airPlayReceipts[name, default: AirPlayReceipt()].playing = true
+                    case "receiver_skipped":
+                        airPlayReceipts[name] = AirPlayReceipt(released: true, category: event["category"],
+                                                              failure: event["message"])
+                    case "receiver_failed":
+                        airPlayReceipts[name] = AirPlayReceipt(failure: event["message"] ?? "AirPlay error")
+                    case "receiver_released", "receiver_stopped":
+                        airPlayReceipts[name, default: AirPlayReceipt()].released = true
+                    default: break
+                    }
+                }
                 guard !stopping else { continue }
                 switch kind {
-                case "authorization": status = "Подтверди запуск PTP в окне macOS"
+                case "authorization": status = "Approve PTP startup in the macOS dialog"
                 case "capture":
                     do {
                         try capture?.start()
                         mixer?.start()
-                        status = "Синхронизация AirPlay…"
+                        status = "Synchronizing AirPlay…"
                     } catch {
                         terminalError = error.localizedDescription
                         shutdown()
@@ -500,39 +536,39 @@ final class Streaming: ObservableObject {
                 case "streaming":
                     isTransmitting = true
                     scheduledStart = event["anchor"]
-                    status = "Передача звука"
+                    status = "Streaming audio"
                 case "receiver_stopped":
-                    if let name = event["receiver"] { receivers[name] = "Остановлено" }
+                    if let name = event["receiver"] { receivers[name] = "Stopped" }
                 case "receiver_retry":
                     if let name = event["receiver"] {
-                        logger.notice("\(name, privacy: .public): повтор подключения AirPlay без перезапуска PTP")
+                        logger.notice("\(name, privacy: .public): retrying AirPlay without restarting PTP")
                     }
                 case "receiver_skipped", "receiver_failed":
                     if let name = event["receiver"] {
                         if kind == "receiver_failed" {
                             failedReceivers.insert(name)
-                            let reason = event["message"] ?? "Ошибка AirPlay"
+                            let reason = event["message"] ?? "AirPlay error"
                             let diagnostic = event["diagnostic"] ?? ""
                             logger.error("\(name, privacy: .public): \(reason, privacy: .public) \(diagnostic, privacy: .public)")
                         }
                         if event["category"] == "tv" { receiversBlockedByTV.insert(name) }
-                        skippedReceivers[name] = event["message"] ?? "недоступна"
+                        skippedReceivers[name] = event["message"] ?? "unavailable"
                         currentVolumes.removeValue(forKey: name)
-                        receivers[name] = "Остановлено"
+                        receivers[name] = "Stopped"
                     }
                 case "connecting", "connected", "playing":
                     if let name = event["receiver"] {
                         receivers[name] = switch kind {
-                        case "connecting": "Подключение"
-                        case "connected": "Синхронизация"
-                        default: "Передача"
+                        case "connecting": "Connecting"
+                        case "connected": "Synchronizing"
+                        default: "Streaming"
                         }
                     }
                 default: break
                 }
             }
             if (capture?.failed.load(ordering: .relaxed) == true || mixer?.failed == true) && terminalError == nil && !stopping {
-                terminalError = "Передатчик не успевает принять аудиопоток"
+                terminalError = "The AirPlay sender could not keep up with the audio stream"
                 shutdown()
             }
             // Process exit is joined after one more read to collect its final event.
@@ -562,9 +598,9 @@ final class Streaming: ObservableObject {
         joinsFile = nil
         joinRequests = [:]
         currentVolumes = [:]
-        let failure = terminalError ?? ((process.terminationStatus == 0 || stopping) ? nil : "AirPlay завершился с ошибкой")
-        status = failure ?? "Передача остановлена"
-        for name in Array(receivers.keys) { receivers[name] = failure == nil ? "Остановлено" : "Отключено" }
+        let failure = terminalError ?? ((process.terminationStatus == 0 || stopping) ? nil : "AirPlay exited with an error")
+        status = failure ?? "Streaming stopped"
+        for name in Array(receivers.keys) { receivers[name] = failure == nil ? "Stopped" : "Disconnected" }
         active = false
         stopping = false
         isTransmitting = false

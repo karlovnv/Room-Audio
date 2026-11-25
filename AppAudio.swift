@@ -36,7 +36,7 @@ struct RunningAudioApp: Identifiable, Equatable {
 
     func audioObjects() throws -> [AudioObjectID] {
         let result = try ProcessAudioClient.snapshot().filter(includes).map(\.object)
-        guard !result.isEmpty else { throw StreamError("Запусти звук в «\(name)» и попробуй ещё раз.") }
+        guard !result.isEmpty else { throw StreamError("Play audio in \(name) and try again.") }
         return result
     }
 
@@ -71,10 +71,10 @@ final class AppSignalMeter {
         tap = try AppAudioTap(processes: processes, playLocally: true)
         guard tap.format.mFormatID == kAudioFormatLinearPCM, tap.format.mBitsPerChannel == 32,
               tap.format.mFormatFlags & kAudioFormatFlagIsFloat != 0 else {
-            throw StreamError("Не удалось прочитать уровень приложения.")
+            throw StreamError("Could not read the app’s audio level.")
         }
         try tapCheck(AudioDeviceCreateIOProcID(tap.device, signalCallback, Unmanaged.passUnretained(self).toOpaque(), &callback))
-        guard let callback else { throw StreamError("Не удалось запустить индикатор приложения.") }
+        guard let callback else { throw StreamError("Could not start the app’s audio meter.") }
         do { try tapCheck(AudioDeviceStart(tap.device, callback)) }
         catch {
             AudioDeviceDestroyIOProcID(tap.device, callback)
@@ -181,5 +181,5 @@ private func tapAddress(_ selector: AudioObjectPropertySelector) -> AudioObjectP
 }
 
 private func tapCheck(_ status: OSStatus) throws {
-    if status != noErr { throw StreamError("Не удалось подключить аудио приложения (Core Audio: \(status))") }
+    if status != noErr { throw AudioCaptureError(status: status, operation: "Could not capture app audio") }
 }

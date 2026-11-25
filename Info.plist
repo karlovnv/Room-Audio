@@ -5,11 +5,11 @@
     <key>CFBundleIdentifier</key><string>local.roomaudio.discovery</string>
     <key>CFBundleName</key><string>Room Audio</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleVersion</key><string>33</string>
-    <key>CFBundleShortVersionString</key><string>0.13.0</string>
+    <key>CFBundleVersion</key><string>38</string>
+    <key>CFBundleShortVersionString</key><string>0.13.5</string>
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>NSBonjourServices</key><array><string>_airplay._tcp</string></array>
-    <key>NSLocalNetworkUsageDescription</key><string>Room Audio ищет AirPlay-устройства в локальной сети.</string>
-    <key>NSMicrophoneUsageDescription</key><string>Room Audio читает звук с выбранного аудиовхода.</string>
-    <key>NSAudioCaptureUsageDescription</key><string>Room Audio определяет, какие приложения сейчас воспроизводят звук, и передаёт выбранный источник на колонки.</string>
+    <key>NSLocalNetworkUsageDescription</key><string>Room Audio finds AirPlay devices on your local network.</string>
+    <key>NSMicrophoneUsageDescription</key><string>Room Audio captures sound from your selected audio input.</string>
+    <key>NSAudioCaptureUsageDescription</key><string>Room Audio detects audio activity and streams sound from your selected apps to your outputs.</string>
 </dict></plist>

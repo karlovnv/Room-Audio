@@ -71,13 +71,33 @@ struct Receiver: Identifiable {
     let id: ID
     var name: String { id.name }
     let model: String?
+
+    static func outputSymbol(name: String, model: String?) -> String {
+        let name = name.lowercased()
+        let model = model?.lowercased() ?? ""
+        if model.hasPrefix("macbook") || name.contains("macbook") { return "laptopcomputer" }
+        if model.hasPrefix("mac") || model.hasPrefix("imac") ||
+            ["imac", "mac mini", "mac studio", "mac pro"].contains(where: name.contains) {
+            return "desktopcomputer"
+        }
+        if model.hasPrefix("appletv") || ["apple tv", "webos", "android tv", "google tv"].contains(where: name.contains) ||
+            name.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).contains("tv") {
+            return "tv"
+        }
+        return "hifispeaker.fill"
+    }
 }
 
 @MainActor
 final class Discovery: ObservableObject {
     @Published private(set) var receivers: [Receiver] = []
-    @Published private(set) var status = "Поиск устройств…"
+    @Published private(set) var localReceiverIDs: Set<Receiver.ID> = []
+    @Published private(set) var status = "Searching for devices…"
     private var browser: NWBrowser?
+
+    func outputSymbol(for id: Receiver.ID) -> String {
+        Receiver.outputSymbol(name: id.name, model: receivers.first { $0.id == id }?.model)
+    }
 
     func start() {
         guard browser == nil else { return }
@@ -87,10 +107,10 @@ final class Discovery: ObservableObject {
             MainActor.assumeIsolated {
                 guard let self, self.browser === browser else { return }
                 switch state {
-                case .ready: self.status = "Поиск в локальной сети"
-                case .waiting(let error): self.status = "Ожидание сети: \(error)"
-                case .failed(let error): self.status = "Ошибка поиска: \(error)"
-                case .cancelled: self.status = "Поиск остановлен"
+                case .ready: self.status = "Searching the local network"
+                case .waiting(let error): self.status = "Waiting for the network: \(error)"
+                case .failed(let error): self.status = "Discovery failed: \(error)"
+                case .cancelled: self.status = "Discovery stopped"
                 default: break
                 }
             }
@@ -99,9 +119,13 @@ final class Discovery: ObservableObject {
             MainActor.assumeIsolated {
                 guard let self, self.browser === browser else { return }
                 var devices: [Receiver.ID: Receiver] = [:]
+                var loopbackIDs = Set<Receiver.ID>()
                 for result in results {
-                    guard case let .service(name, _, domain, _) = result.endpoint else { continue }
+                    guard case let .service(name, _, domain, interface) = result.endpoint else { continue }
                     let id = Receiver.ID(name: name, domain: domain)
+                    if interface?.type == .loopback || result.interfaces.contains(where: { $0.type == .loopback }) {
+                        loopbackIDs.insert(id)
+                    }
                     var model: String?
                     if case let .bonjour(txt) = result.metadata {
                         model = txt["model"]
@@ -110,6 +134,8 @@ final class Discovery: ObservableObject {
                         devices[id] = Receiver(id: id, model: model)
                     }
                 }
+                let localIDs = self.localReceiverIDs.subtracting(devices.keys).union(loopbackIDs)
+                if localIDs != self.localReceiverIDs { self.localReceiverIDs = localIDs }
                 self.receivers = devices.values.sorted {
                     ($0.name.localizedLowercase, $0.id.domain) < ($1.name.localizedLowercase, $1.id.domain)
                 }
@@ -148,35 +174,35 @@ struct RoomAudioView: View {
             Text("Room Audio").font(.largeTitle.bold())
             VStack(alignment: .leading, spacing: 10) {
                 if streaming.active, let liveSourceName {
-                    LabeledContent("Текущий источник", value: liveSourceName)
+                    LabeledContent("Current Source", value: liveSourceName)
                 }
-                Picker(streaming.active ? "Источник для следующего запуска" : "Источник", selection: $useApplication) {
-                    Text("Аудиоустройство").tag(false)
-                    Text("Приложение").tag(true)
+                Picker(streaming.active ? "Source for Next Stream" : "Source", selection: $useApplication) {
+                    Text("Audio Device").tag(false)
+                    Text("App").tag(true)
                 }.pickerStyle(.segmented)
                 if useApplication {
                     HStack {
-                        Picker("Приложение", selection: $application) {
-                            Text("Выбери приложение").tag(nil as pid_t?)
+                        Picker("App", selection: $application) {
+                            Text("Select an app").tag(nil as pid_t?)
                             ForEach(applications) { app in
-                                Text(app.hasActiveOutput ? "\(app.name) · активный вывод" : app.name)
+                                Text(app.hasActiveOutput ? "\(app.name) · output active" : app.name)
                                     .tag(Optional(app.id))
                             }
                         }
-                        Button("Обновить", action: refreshApplications)
+                        Button("Refresh", action: refreshApplications)
                     }
-                    Toggle("Также играть на Mac", isOn: $playLocally).toggleStyle(.checkbox)
+                    Toggle("Also Play on This Mac", isOn: $playLocally).toggleStyle(.checkbox)
                 } else {
                     HStack {
-                        Picker("Аудиовход", selection: $input) {
-                            Text("Выбери устройство").tag(nil as AudioObjectID?)
+                        Picker("Audio Input", selection: $input) {
+                            Text("Select a device").tag(nil as AudioObjectID?)
                             ForEach(inputs) { device in Text(device.name).tag(Optional(device.id)) }
                         }
-                        Button("Обновить входы", action: refreshInputs)
+                        Button("Refresh Inputs", action: refreshInputs)
                     }
                 }
                 if streaming.active {
-                    Text("Выбор применяется при следующем запуске.")
+                    Text("The selection takes effect the next time you start streaming.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -184,21 +210,21 @@ struct RoomAudioView: View {
             HStack {
                 let peak = streaming.signalLevel
                 let db = peak > 0 ? 20 * log10(Double(peak)) : -Double.infinity
-                Text("Входной сигнал")
+                Text("Input Signal")
                 ProgressView(value: min(1, max(0, (db + 60) / 60)))
-                    .accessibilityLabel("Уровень входного сигнала")
-                Text(db > -60 ? "\(Int(db.rounded())) dBFS" : "Тишина")
+                    .accessibilityLabel("Input signal level")
+                Text(db > -60 ? "\(Int(db.rounded())) dBFS" : "Silence")
                     .monospacedDigit().frame(width: 72, alignment: .trailing)
             }.font(.caption).foregroundStyle(.secondary)
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("Выходы").font(.headline)
+                Text("Outputs").font(.headline)
                 Text(discovery.status).font(.caption).foregroundStyle(.secondary)
             }
             List {
                 Section("Bluetooth") {
                     if bluetoothOutputs.isEmpty {
-                        Text("Подключи устройство в настройках Bluetooth Mac").foregroundStyle(.secondary)
+                        Text("Connect a device in your Mac’s Bluetooth settings.").foregroundStyle(.secondary)
                     }
                     ForEach(bluetoothOutputs) { output in
                         VStack(alignment: .leading) {
@@ -210,7 +236,7 @@ struct RoomAudioView: View {
                                 }
                             )) {
                                 HStack {
-                                    Text(output.name)
+                                    Label(output.name, systemImage: LocalOutput.symbol)
                                     Spacer()
                                     if let status = streaming.receivers[output.name] {
                                         Text(status).font(.caption).foregroundStyle(.secondary)
@@ -219,7 +245,7 @@ struct RoomAudioView: View {
                             }.toggleStyle(.checkbox).disabled(streaming.active)
                             if bluetoothSelection == output.id {
                                 HStack {
-                                    Slider(value: $bluetoothVolume, in: 0...100, step: 1) { Text("Громкость Bluetooth") }
+                                    Slider(value: $bluetoothVolume, in: 0...100, step: 1) { Text("Bluetooth Volume") }
                                     Text("\(Int(bluetoothVolume))%").monospacedDigit()
                                 }.onChange(of: bluetoothVolume) { _, value in
                                     streaming.setVolume(Int(value), for: output.name)
@@ -230,7 +256,7 @@ struct RoomAudioView: View {
                 }
                 Section("AirPlay") {
                 if discovery.receivers.isEmpty {
-                    Text("Устройства пока не найдены").foregroundStyle(.secondary)
+                    Text("No devices found yet").foregroundStyle(.secondary)
                 }
                 ForEach(discovery.receivers) { receiver in
                     VStack(alignment: .leading) {
@@ -246,7 +272,7 @@ struct RoomAudioView: View {
                     )) {
                         HStack {
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(receiver.name)
+                                Label(receiver.name, systemImage: discovery.outputSymbol(for: receiver.id))
                                 if let model = receiver.model {
                                     Text(model).font(.caption).foregroundStyle(.secondary)
                                 }
@@ -266,7 +292,7 @@ struct RoomAudioView: View {
                                     volumes[receiver.id] = volume
                                     streaming.setVolume(volume, for: receiver.name)
                                 }
-                            ), in: 0...100, step: 1) { Text("Громкость \(receiver.name)") }
+                            ), in: 0...100, step: 1) { Text("Volume \(receiver.name)") }
                             Text("\(volumes[receiver.id] ?? 45)%").monospacedDigit()
                         }.disabled(streaming.stopping)
                     }
@@ -279,9 +305,9 @@ struct RoomAudioView: View {
                 Text(streaming.status).foregroundStyle(.secondary)
                 Spacer()
                 if streaming.active {
-                    Button("Остановить", action: streaming.stop).disabled(streaming.stopping)
+                    Button("Stop", action: streaming.stop).disabled(streaming.stopping)
                 } else {
-                    Button("Запустить") {
+                    Button("Start") {
                         let selected = discovery.receivers.filter { selection.contains($0.id) }
                         let levels = Dictionary(selected.map { ($0.name, volumes[$0.id] ?? 45) }, uniquingKeysWith: { first, _ in first })
                         do {
@@ -292,7 +318,7 @@ struct RoomAudioView: View {
                                 name = app.name
                             } else if !useApplication, let input {
                                 source = .device(input)
-                                name = inputs.first(where: { $0.id == input })?.name ?? "Аудиоустройство"
+                                name = inputs.first(where: { $0.id == input })?.name ?? "Audio Device"
                             } else { return }
                             inputError = nil
                             if let bluetoothSelection, let output = bluetoothOutputs.first(where: { $0.id == bluetoothSelection }) {
@@ -377,7 +403,7 @@ struct RoomAudioView: View {
                 input = inputs.first { $0.name == "BlackHole 2ch" }?.id
             }
         } catch {
-            inputError = "Не удалось получить список входов: \(error.localizedDescription)"
+            inputError = "Could not list audio inputs: \(error.localizedDescription)"
         }
     }
 
@@ -489,7 +515,7 @@ struct RoomAudioView: View {
             try? await Task.sleep(for: .milliseconds(100))
         }
         print("ROOM_AUDIO_STOP: \(streaming.status)")
-        exit(success && !streaming.active && streaming.status == "Передача остановлена" ? 0 : 1)
+        exit(success && !streaming.active && streaming.status == "Streaming stopped" ? 0 : 1)
     }
 
     private func verifyApplication(feeder: String, clip: String) async {
@@ -557,7 +583,7 @@ struct RoomAudioView: View {
             try? await Task.sleep(for: .milliseconds(100))
         }
         print("ROOM_AUDIO_APP_SOURCE_STOP: \(streaming.status)")
-        exit(passed && !streaming.active && streaming.status == "Передача остановлена" ? 0 : 1)
+        exit(passed && !streaming.active && streaming.status == "Streaming stopped" ? 0 : 1)
     }
 
     private func verifyBluetooth(feeder: String, clip: String) async {
@@ -633,7 +659,7 @@ final class RoomAudioDelegate: NSObject, NSApplicationDelegate {
     }
 
     private static func isRoomAudioWindow(_ window: NSWindow) -> Bool {
-        window.styleMask.contains(.titled) && ["Room Audio", "Группа Room Audio"].contains(window.title)
+        window.styleMask.contains(.titled) && ["Room Audio", "Room Audio Group", "Room Audio Sources"].contains(window.title)
     }
 
     static func openMainWindow(_ openWindow: OpenWindowAction) {
@@ -645,6 +671,12 @@ final class RoomAudioDelegate: NSObject, NSApplicationDelegate {
     static func openGroupWindow(_ openWindow: OpenWindowAction, id: UUID) {
         NSApp.setActivationPolicy(.regular)
         openWindow(id: "group-mixer", value: id)
+        NSApp.activate()
+    }
+
+    static func openSourcesWindow(_ openWindow: OpenWindowAction, id: UUID) {
+        NSApp.setActivationPolicy(.regular)
+        openWindow(id: "group-sources", value: id)
         NSApp.activate()
     }
 
@@ -684,7 +716,7 @@ struct RoomAudioApp: App {
             }
         }.defaultSize(width: 600, height: 570)
 
-        WindowGroup("Группа Room Audio", id: "group-mixer", for: UUID.self) { $groupID in
+        WindowGroup("Room Audio Group", id: "group-mixer", for: UUID.self) { $groupID in
             if let groupID {
                 GroupEditor(groupID: groupID, workspace: workspace, groups: workspace.savedGroups)
             }
@@ -692,12 +724,20 @@ struct RoomAudioApp: App {
         .defaultSize(width: 530, height: 460)
         .restorationBehavior(.disabled)
 
+        WindowGroup("Room Audio Sources", id: "group-sources", for: UUID.self) { $groupID in
+            if let groupID {
+                GroupSourcesWindow(groupID: groupID, workspace: workspace, groups: workspace.savedGroups)
+            }
+        }
+        .defaultSize(width: 530, height: 440)
+        .restorationBehavior(.disabled)
+
         MenuBarExtra {
             RoutingView(workspace: workspace, menuBar: true)
         } label: {
             let busy = workspace.isConnecting || workspace.isReconnecting
-            let title = if workspace.isReconnecting { "Room Audio · Переподключение" }
-                else if workspace.isConnecting { "Room Audio · Подключение" }
+            let title = if workspace.isReconnecting { "Room Audio · Reconnecting" }
+                else if workspace.isConnecting { "Room Audio · Connecting" }
                 else { "Room Audio" }
             Label(title, systemImage: busy ? ConnectionIcon.symbol : "speaker.wave.2")
         }

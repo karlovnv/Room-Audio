@@ -3,6 +3,7 @@ import Foundation
 import Synchronization
 
 struct LocalOutput: Identifiable, Equatable {
+    static let symbol = "headphones"
     let id: AudioObjectID
     let name: String
     let uid: String?
@@ -72,7 +73,7 @@ final class LocalPlayback {
         guard description.mChannelsPerFrame == 2, description.mSampleRate > 0,
               description.mFormatID == kAudioFormatLinearPCM, description.mBitsPerChannel == 32,
               description.mFormatFlags & kAudioFormatFlagIsFloat != 0 else {
-            throw StreamError("Для Bluetooth нужен стереовыход Float32.")
+            throw StreamError("Bluetooth requires a Float32 stereo output.")
         }
         outputRate = description.mSampleRate
         ring = .allocate(capacity: capacity * 2)
@@ -81,7 +82,7 @@ final class LocalPlayback {
     func start(inputRate: Int) throws {
         self.inputRate = Double(inputRate)
         try outputCheck(AudioDeviceCreateIOProcID(id, outputCallback, Unmanaged.passUnretained(self).toOpaque(), &callback))
-        guard let callback else { throw StreamError("Не удалось открыть Bluetooth-выход.") }
+        guard let callback else { throw StreamError("Could not open the Bluetooth output.") }
         try outputCheck(AudioDeviceStart(id, callback))
     }
 

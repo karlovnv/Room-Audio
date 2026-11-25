@@ -21,7 +21,7 @@ final class SharedPTP {
         init(receivers: [String]) throws {
             guard let script = Bundle.main.url(forResource: "stream", withExtension: "py"),
                   let transport = Bundle.main.url(forResource: "cliairplay", withExtension: nil) else {
-                throw StreamError("Компоненты AirPlay отсутствуют")
+                throw StreamError("AirPlay components are missing")
             }
             folder = FileManager.default.temporaryDirectory.appendingPathComponent("room-audio-shared-\(UUID())")
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false,
@@ -77,7 +77,7 @@ final class SharedPTP {
             session = nil
         }
         if session == nil { session = try Session(receivers: receivers) }
-        guard let current = session else { throw StreamError("Не удалось запустить PTP") }
+        guard let current = session else { throw StreamError("Could not start PTP") }
         leases.insert(token)
         do {
             let deadline = ContinuousClock().now + .seconds(130)
@@ -85,15 +85,18 @@ final class SharedPTP {
                 try Task.checkCancellation()
                 let events = current.events
                 if let error = events.last(where: { $0["status"] == "error" })?["message"] {
+                    if events.last(where: { $0["status"] == "error" })?["category"] == "local" {
+                        throw LocalAirPlayOutputError(message: error)
+                    }
                     throw StreamError(error)
                 }
-                guard current.process.isRunning else { throw StreamError("Общий процесс PTP завершился") }
+                guard current.process.isRunning else { throw StreamError("The shared PTP process exited") }
                 if let address = events.last(where: { $0["status"] == "clock_ready" })?["address"] {
                     return address
                 }
                 try await Task.sleep(for: .milliseconds(100))
             }
-            throw StreamError("Истекло время запуска общего PTP")
+            throw StreamError("Timed out starting shared PTP")
         } catch {
             release(token)
             throw error
@@ -144,6 +147,14 @@ enum RouteDestination: Identifiable, Equatable {
         return false
     }
 
+    @MainActor
+    func outputSymbol(in discovery: Discovery) -> String {
+        switch self {
+        case .airplay(let id): discovery.outputSymbol(for: id)
+        case .bluetooth: LocalOutput.symbol
+        }
+    }
+
     var visibilityKey: String {
         switch self {
         case .airplay(let id): "airplay:\(id.domain):\(id.name)"
@@ -170,6 +181,7 @@ final class OutputRoute: ObservableObject, Identifiable {
     @Published private(set) var runningSourceName: String?
     @Published private(set) var error: String?
     private var session: Task<Void, Never>?
+    var transportPending: Bool { session != nil }
 
     var isConnecting: Bool { starting || stream.isConnecting }
 
@@ -214,6 +226,9 @@ final class OutputRoute: ObservableObject, Identifiable {
                 }
             } catch is CancellationError {
                 return
+            } catch let error as LocalAirPlayOutputError {
+                stream.markLocalAirPlay([destination.name], message: error.localizedDescription)
+                self.error = error.localizedDescription
             } catch {
                 self.error = error.localizedDescription
             }
@@ -243,6 +258,7 @@ final class SynchronizedGroup: ObservableObject {
     private var exclusions: [String: String] = [:]
     private var startingVolumes: [String: Int] = [:]
     private var session: Task<Void, Never>?
+    var transportPending: Bool { session != nil }
     private var pendingMix: [MixInput]?
 
     var active: Bool { preparing || stream.active || !members.isEmpty }
@@ -254,7 +270,7 @@ final class SynchronizedGroup: ObservableObject {
 
     var transmittingReceivers: Set<String> {
         guard stream.isTransmitting, !stream.stopping else { return [] }
-        return members.filter { stream.receivers[$0] == "Передача" }
+        return members.filter { stream.receivers[$0] == "Streaming" }
     }
 
     func attempted(_ receiver: String) -> Bool {
@@ -265,7 +281,7 @@ final class SynchronizedGroup: ObservableObject {
         if let reason = exclusions[receiver] ?? stream.skippedReceivers[receiver] { return reason }
         if !active, attemptedReceivers.contains(receiver), let error {
             if stream.skippedReceivers.isEmpty { return error }
-            return "передача группы прервалась"
+            return "Group stream interrupted"
         }
         return nil
     }
@@ -310,15 +326,18 @@ final class SynchronizedGroup: ObservableObject {
                 guard stream.active else { throw StreamError(stream.status) }
                 while stream.active {
                     if stream.isTransmitting { hasTransmitted = true }
-                    let stopped = members.filter { stream.receivers[$0] == "Остановлено" }
+                    let stopped = members.filter { stream.receivers[$0] == "Stopped" }
                     if !stopped.isEmpty { members.subtract(stopped) }
-                    let joined = stream.receivers.filter { ["Подключение", "Синхронизация", "Передача"].contains($0.value) }.map(\.key)
+                    let joined = stream.receivers.filter { ["Connecting", "Synchronizing", "Streaming"].contains($0.value) }.map(\.key)
                     if !Set(joined).isSubset(of: members) { members.formUnion(joined) }
                     try? await Task.sleep(for: .milliseconds(100))
                 }
-                if stream.status != "Передача остановлена" { error = stream.status }
+                if stream.status != "Streaming stopped" { error = stream.status }
             } catch is CancellationError {
                 return
+            } catch let error as LocalAirPlayOutputError {
+                stream.markLocalAirPlay(volumes.keys.sorted(), message: error.localizedDescription)
+                self.error = error.localizedDescription
             } catch {
                 self.error = error.localizedDescription
             }
@@ -341,14 +360,6 @@ final class SynchronizedGroup: ObservableObject {
         if stream.joinTVReceiver(receiver, volume: volume) { members.insert(receiver) }
     }
 
-    func joinTransferredReceiver(_ receiver: String, volume: Int) -> Bool {
-        guard stream.joinTransferredReceiver(receiver, volume: volume) else { return false }
-        exclusions.removeValue(forKey: receiver)
-        attemptedReceivers.insert(receiver)
-        members.insert(receiver)
-        return true
-    }
-
     func setVolumes(_ changes: [String: Int]) {
         if preparing {
             for (name, volume) in changes where startingVolumes[name] != nil { startingVolumes[name] = volume }
@@ -369,16 +380,14 @@ final class RoutingWorkspace: ObservableObject {
     @Published private(set) var apps: [RunningAudioApp] = []
     @Published private(set) var inputs: [AudioInput] = []
     @Published private(set) var destinations: [RouteDestination] = []
+    @Published private(set) var offlineActiveOutputs: Set<RouteDestination.ID> = []
     @Published var groupSelection: Set<RouteDestination.ID> = []
     var volumePreferences: OutputVolumePreferences
-    var groupPlayback: [UUID: SavedGroupPlayback] = [:]
-    @Published var recoveringGroups: Set<UUID> = []
-    @Published private(set) var recoveringReceivers: [UUID: Set<Receiver.ID>] = [:]
-    @Published var receiverTransfers: [Receiver.ID: UUID] = [:]
-    var receiverTransferTasks: [Receiver.ID: Task<Void, Never>] = [:]
+    let airPlay = AirPlayCoordinator()
     var waitingForWake = false
     private let defaults: UserDefaults
     private var routeActivityObservers: [RouteDestination.ID: AnyCancellable] = [:]
+    private var lastAvailableActiveOutputs: Set<RouteDestination.ID> = []
     private var groupActivityObservers: Set<AnyCancellable> = []
     private var polling: Task<Void, Never>?
     private var checkingWindow = false
@@ -391,6 +400,9 @@ final class RoutingWorkspace: ObservableObject {
         volumePreferences = data.flatMap { try? JSONDecoder().decode(OutputVolumePreferences.self, from: $0) }
             ?? OutputVolumePreferences()
         groupActivityObservers = [
+            airPlay.objectWillChange.sink { [weak self] _ in
+                MainActor.assumeIsolated { self?.objectWillChange.send() }
+            },
             savedGroups.objectWillChange.sink { [weak self] _ in
                 MainActor.assumeIsolated { self?.objectWillChange.send() }
             },
@@ -412,7 +424,7 @@ final class RoutingWorkspace: ObservableObject {
                 do { try await Task.sleep(for: .seconds(1)) } catch { break }
                 self?.refresh()
                 self?.refreshSavedGroupMixes()
-                self?.recoverSavedGroups()
+                if let self { airPlay.reconcile(self) }
             }
         }
     }
@@ -438,9 +450,23 @@ final class RoutingWorkspace: ObservableObject {
                 }
         }
         if destinations != available {
+            let availableIDs = Set(available.map(\.id))
+            let previouslyActive = lastAvailableActiveOutputs.union(destinations.filter(hasRouteActivity).map(\.id))
+            let missing = offlineActiveOutputs.union(previouslyActive).subtracting(availableIDs)
+            if missing != offlineActiveOutputs { offlineActiveOutputs = missing }
             destinations = available
-            groupSelection.formIntersection(available.map(\.id))
+            groupSelection.formIntersection(availableIDs)
         }
+        lastAvailableActiveOutputs = Set(available.filter(hasRouteActivity).map(\.id))
+    }
+
+    func hasRouteActivity(_ destination: RouteDestination) -> Bool {
+        let route = routes[destination.id]
+        if route?.starting == true || route?.stream.active == true { return true }
+        if case .airplay(let id) = destination, let slot = airPlay.slots[id] {
+            return !slot.claims.isEmpty || slot.connection != nil
+        }
+        return false
     }
 
     func setRouteVolume(_ volume: Double, route: OutputRoute) {
@@ -474,33 +500,33 @@ final class RoutingWorkspace: ObservableObject {
     }
 
     func stopAll() {
-        cancelReceiverTransfers()
-        groupPlayback.removeAll()
-        recoveringGroups.removeAll()
-        recoveringReceivers.removeAll()
+        airPlay.stopAll()
+        airPlay.reconcile(self)
         for route in routes.values { route.stop() }
         synchronizedGroup.stop()
         savedGroups.stopAll()
     }
 
-    var isReconnecting: Bool { !recoveringGroups.isEmpty || !recoveringReceivers.isEmpty }
-    var isConnecting: Bool {
-        !receiverTransfers.isEmpty || savedGroups.isConnecting || synchronizedGroup.isConnecting ||
-            routes.values.contains(where: \.isConnecting)
+    var isReconnecting: Bool {
+        airPlay.slots.keys.contains(where: isReconnecting(receiver:))
     }
 
+    var isConnecting: Bool { savedGroups.isConnecting || synchronizedGroup.isConnecting ||
+        routes.values.contains(where: \.isConnecting) }
+
     func isReconnecting(group id: UUID) -> Bool {
-        recoveringGroups.contains(id) || recoveringReceivers[id] != nil
+        airPlay.slots.keys.contains { airPlay.requested($0, by: .saved(id)) && isReconnecting(receiver: $0) }
     }
 
     func isReconnecting(receiver id: Receiver.ID) -> Bool {
-        recoveringReceivers.values.contains { $0.contains(id) } ||
-            recoveringGroups.contains { groupPlayback[$0]?.receivers.contains(id) == true }
+        guard let slot = airPlay.slots[id] else { return false }
+        if case .retry = slot.state { return true }
+        return waitingForWake && !slot.claims.isEmpty
     }
 
-    func setRecoveringReceivers(_ receivers: Set<Receiver.ID>, in group: UUID) {
-        let value = receivers.isEmpty ? nil : receivers
-        if recoveringReceivers[group] != value { recoveringReceivers[group] = value }
+    func stopQuickGroup() {
+        airPlay.stop(.quick)
+        airPlay.reconcile(self)
     }
 
     func stopDiscovery() {
@@ -556,7 +582,7 @@ struct RoutingView: View {
     @ObservedObject private var discovery: Discovery
     @ObservedObject private var synchronizedGroup: SynchronizedGroup
     @ObservedObject private var savedGroups: SpeakerGroups
-    @AppStorage("room-audio.simple-mode") private var simpleMode = false
+    @AppStorage("room-audio.simple-mode") private var mainWindowSimpleMode = false
     @AppStorage("room-audio.pinned-outputs") private var pinnedOutputsData = Data()
     @State private var editingVisibility = false
     @State private var installingPTP = false
@@ -579,18 +605,15 @@ struct RoutingView: View {
     private var apps: [RunningAudioApp] { workspace.apps }
     private var inputs: [AudioInput] { workspace.inputs }
     private var clock: SharedPTP { workspace.clock }
+    private var simpleMode: Bool { menuBar || mainWindowSimpleMode }
 
     var body: some View {
         Group {
-            if simpleMode || (menuBar && editingVisibility) {
-                if menuBar {
-                    compactPanel.frame(width: 440)
-                } else {
-                    compactPanel.frame(minWidth: 440, idealWidth: 600, maxWidth: .infinity,
-                                       minHeight: 320, maxHeight: .infinity, alignment: .topLeading)
-                }
-            } else if menuBar {
-                detailedPanel.frame(width: 560, height: 490)
+            if menuBar {
+                compactPanel.frame(width: 440)
+            } else if simpleMode {
+                compactPanel.frame(minWidth: 440, idealWidth: 600, maxWidth: .infinity,
+                                   minHeight: 320, maxHeight: .infinity, alignment: .topLeading)
             } else {
                 detailedPanel
             }
@@ -600,26 +623,29 @@ struct RoutingView: View {
             guard diagnostics else { return }
             if CommandLine.arguments.contains("--verify-saved-groups") {
                 verifySavedGroups()
+            } else if CommandLine.arguments.contains("--verify-routing-handoff"), !workspace.checkingPTPService {
+                workspace.checkingPTPService = true
+                await verifyRoutingHandoff()
             } else if CommandLine.arguments.contains("--verify-group-recovery"), !workspace.checkingPTPService {
                 workspace.checkingPTPService = true
                 Task {
                     do {
                         guard let group = savedGroups.groups.first(where: { $0.name == "All Sonos" }),
                               let session = savedGroups.session(for: group.id) else {
-                            throw StreamError("Группа All Sonos не найдена.")
+                            throw StreamError("All Sonos group not found.")
                         }
-                        try await waitForPTPTest("обнаружение колонок") {
+                        try await waitForPTPTest("output discovery") {
                             group.members.isSubset(of: Set(destinations.compactMap {
                                 if case .airplay(let id) = $0 { id } else { nil }
                             }))
                         }
                         workspace.startSavedGroup(group, session: session)
-                        try await waitForPTPTest("передача All Sonos", timeout: 90) {
+                        try await waitForPTPTest("All Sonos streaming", timeout: 90) {
                             session.transmittingReceivers == Set(group.members.map(\.name)) ||
-                                (!session.active && workspace.groupPlayback[group.id] == nil && session.error != nil)
+                                (!session.active && workspace.airPlay.runs[.saved(group.id)] == nil && session.error != nil)
                         }
                         guard let anchor = session.stream.scheduledStart else {
-                            throw StreamError(session.error ?? "Нет общего старта.")
+                            throw StreamError(session.error ?? "Synchronized start was not confirmed.")
                         }
                         print("RECOVERY_TEST_PLAYING source=\(session.sourceName ?? "?") anchor=\(anchor)")
                     } catch {
@@ -664,7 +690,7 @@ struct RoutingView: View {
                     if !simpleMode {
                         Text(discovery.status).font(.caption).foregroundStyle(.secondary)
                         if !SharedPTP.serviceInstalled {
-                            Button("AirPlay без пароля…", action: installPTP).disabled(installingPTP)
+                            Button("Set Up AirPlay Sync…", action: installPTP).disabled(installingPTP)
                         }
                         if let setupError { Text(setupError).font(.caption).foregroundStyle(.secondary) }
                     }
@@ -672,16 +698,16 @@ struct RoutingView: View {
                 Spacer()
                 panelMenu
             }
-            if !simpleMode || synchronizedGroup.active {
+            if !simpleMode || workspace.airPlay.runs[.quick] != nil {
                 HStack {
-                    if synchronizedGroup.members.isEmpty {
-                        Button("Запустить синхронно", action: startGroup)
+                    if workspace.airPlay.runs[.quick] == nil {
+                        Button("Start in Sync", action: startGroup)
                             .buttonStyle(.borderedProminent)
                             .disabled(workspace.groupSelection.count < 2)
-                        Text("Отметь выходы AirPlay с одним источником.").font(.caption).foregroundStyle(.secondary)
+                        Text("Select AirPlay outputs that use the same source.").font(.caption).foregroundStyle(.secondary)
                     } else {
-                        Button("Остановить группу", action: synchronizedGroup.stop)
-                        Text(synchronizedGroup.preparing ? "Подготовка группы…" : "Синхронная группа")
+                        Button("Stop Group", action: workspace.stopQuickGroup)
+                        Text(synchronizedGroup.preparing ? "Preparing group…" : "Synchronized Group")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -698,18 +724,18 @@ struct RoutingView: View {
                 let availableIDs = Set(destinations.map(\.id))
                 let missing = knownDestinations.filter { !availableIDs.contains($0.id) && isVisible($0) }
                 if simpleMode && visible.isEmpty && missing.isEmpty && savedGroups.groups.isEmpty {
-                    Text("Выбери колонки в «Видимость выходов».")
+                    Text("Choose which outputs to show in Output Visibility.")
                         .foregroundStyle(.secondary)
                 } else if !simpleMode && destinations.isEmpty {
-                    Text("Ожидание аудиовыходов…").foregroundStyle(.secondary)
+                    Text("Waiting for outputs…").foregroundStyle(.secondary)
                 }
                 if simpleMode {
-                    group("Колонки", visible)
+                    group("Outputs", visible)
                 } else {
                     group("AirPlay", visible.filter(\.isAirPlay))
                     group("Bluetooth", visible.filter { !$0.isAirPlay })
                 }
-                group("Недоступные выходы", missing, available: false)
+                group("Unavailable Outputs", missing, available: false)
             }.listStyle(.inset)
         }
         .padding(20)
@@ -719,30 +745,31 @@ struct RoutingView: View {
     private var panelMenu: some View {
         Menu {
             if menuBar {
-                Button("Открыть окно") { RoomAudioDelegate.openMainWindow(openWindow) }
+                Button("Open Main Window") { RoomAudioDelegate.openMainWindow(openWindow) }
+            } else {
+                Button("New Group…") { RoomAudioDelegate.openGroupWindow(openWindow, id: UUID()) }
             }
-            Button("Новая группа…") { RoomAudioDelegate.openGroupWindow(openWindow, id: UUID()) }
-            Button("Видимость выходов") { editingVisibility = true }
-            Toggle("Простой режим", isOn: $simpleMode)
+            Button("Output Visibility") { editingVisibility = true }
+            if !menuBar { Toggle("Simple Mode", isOn: $mainWindowSimpleMode) }
             Divider()
-            Button("Остановить всё", action: workspace.stopAll)
-            Button("Выйти") { NSApp.terminate(nil) }
+            Button("Stop All", action: workspace.stopAll)
+            Button("Quit Room Audio") { NSApp.terminate(nil) }
         } label: {
             Image(systemName: "ellipsis").frame(width: 24)
         }
         .menuIndicator(.hidden)
         .fixedSize()
-        .accessibilityLabel("Настройки и команды")
-        .help("Настройки и команды")
+        .accessibilityLabel("Settings and Actions")
+        .help("Settings and Actions")
     }
 
     private var compactPanel: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text(editingVisibility ? "Видимость выходов" : "Room Audio").font(.headline)
+                Text(editingVisibility ? "Output Visibility" : "Room Audio").font(.headline)
                 Spacer()
                 if editingVisibility {
-                    Button("Готово") { editingVisibility = false }
+                    Button("Done") { editingVisibility = false }
                 } else {
                     panelMenu
                 }
@@ -758,7 +785,7 @@ struct RoutingView: View {
 
     private var compactVisibilityOptions: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Всегда показывать в простом режиме")
+            Text("Always Show in Simple Mode")
                 .font(.caption.weight(.semibold)).foregroundStyle(.secondary)
             visibilityOptions
         }
@@ -767,38 +794,33 @@ struct RoutingView: View {
 
     private var compactRoutes: some View {
         let availableIDs = Set(destinations.map(\.id))
-        let speakers = knownDestinations.filter { destination in
-            if isVisible(destination) { return true }
-            guard case .airplay(let id) = destination, availableIDs.contains(destination.id),
-                  let (_, session) = savedGroups.latestAttempt(for: id),
-                  let route = routes[destination.id], session.attemptedAt >= route.attemptedAt else { return false }
-            return session.stream.receiversBlockedByTV.contains(id.name)
-        }
+        let outputs = knownDestinations.filter(isVisible)
         return VStack(alignment: .leading, spacing: 12) {
-            if synchronizedGroup.active {
-                Button("Остановить синхронную группу", action: synchronizedGroup.stop)
+            if workspace.airPlay.runs[.quick] != nil {
+                Button("Stop Synchronized Group", action: workspace.stopQuickGroup)
             }
             if !savedGroups.groups.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Группы").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    Text("Groups").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
                     ForEach(savedGroups.groups) { group in
                         if let session = savedGroups.session(for: group.id) {
                             SavedGroupRow(group: group, session: session, stream: session.stream,
-                                          workspace: workspace, groups: savedGroups, simpleMode: true, compact: true)
+                                          workspace: workspace, groups: savedGroups, simpleMode: true, compact: true,
+                                          allowsGroupEditing: !menuBar)
                         }
                     }
                 }
             }
-            if !speakers.isEmpty {
+            if !outputs.isEmpty {
                 if !savedGroups.groups.isEmpty { Divider() }
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Колонки").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                    ForEach(speakers) { destination in
+                    Text("Outputs").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    ForEach(outputs) { destination in
                         routeRow(destination, available: availableIDs.contains(destination.id), compact: true)
                     }
                 }
             } else if savedGroups.groups.isEmpty {
-                Text("Выбери колонки в «Видимость выходов».").foregroundStyle(.secondary)
+                Text("Choose which outputs to show in Output Visibility.").foregroundStyle(.secondary)
             }
         }
     }
@@ -813,7 +835,7 @@ struct RoutingView: View {
     private func installPTP() {
         guard let helper = Bundle.main.url(forResource: "PTPService", withExtension: nil),
               let transport = Bundle.main.url(forResource: "cliairplay", withExtension: nil) else {
-            setupError = "Компоненты службы PTP отсутствуют."
+            setupError = "PTP service components are missing."
             return
         }
         installingPTP = true
@@ -824,7 +846,7 @@ struct RoutingView: View {
         installer.terminationHandler = { process in
             let status = process.terminationStatus
             Task { @MainActor in
-                if status != 0 { setupError = "Установка службы PTP не завершилась." }
+                if status != 0 { setupError = "PTP service installation did not complete." }
                 installingPTP = false
             }
         }
@@ -840,16 +862,17 @@ struct RoutingView: View {
     }
 
     private var visibilitySettings: some View {
-        Section("Всегда показывать в простом режиме") {
+        Section("Always Show in Simple Mode") {
             visibilityOptions
         }
     }
 
     @ViewBuilder private var visibilityOptions: some View {
-        if knownDestinations.isEmpty {
-            Text("Ожидание аудиовыходов…").foregroundStyle(.secondary)
+        let pinnable = knownDestinations.filter { !isLocalAirPlay($0) }
+        if pinnable.isEmpty {
+            Text("Waiting for outputs…").foregroundStyle(.secondary)
         }
-        ForEach(knownDestinations, id: \.visibilityKey) { destination in
+        ForEach(pinnable, id: \.visibilityKey) { destination in
             let names = if case .airplay(let id) = destination {
                 savedGroups.groups.filter { $0.members.contains(id) }.map(\.name)
             } else { [String]() }
@@ -863,7 +886,7 @@ struct RoutingView: View {
                 }
             )) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(destination.name)
+                    Label(destination.name, systemImage: destination.outputSymbol(in: discovery))
                     if !names.isEmpty {
                         Text(names.joined(separator: " · ")).font(.caption).foregroundStyle(.secondary)
                     }
@@ -874,12 +897,16 @@ struct RoutingView: View {
 
     private func isVisible(_ destination: RouteDestination) -> Bool {
         guard simpleMode else { return true }
+        guard !isLocalAirPlay(destination),
+              routes[destination.id] != nil || destinations.contains(destination) else { return false }
         if pinnedOutputs.contains(destination.visibilityKey) { return true }
         if case .airplay(let id) = destination, workspace.isReconnecting(receiver: id) { return true }
-        let route = routes[destination.id]
-        if route?.starting == true || route?.stream.active == true { return true }
-        return destination.isAirPlay &&
-            (synchronizedGroup.members.contains(destination.name) || savedGroups.owner(of: destination.name) != nil)
+        return workspace.offlineActiveOutputs.contains(destination.id) || workspace.hasRouteActivity(destination)
+    }
+
+    private func isLocalAirPlay(_ destination: RouteDestination) -> Bool {
+        guard case .airplay(let id) = destination else { return false }
+        return discovery.localReceiverIDs.contains(id)
     }
 
     @ViewBuilder private func group(_ title: String, _ destinations: [RouteDestination], available: Bool = true) -> some View {
@@ -894,19 +921,15 @@ struct RoutingView: View {
 
     @ViewBuilder private func routeRow(_ destination: RouteDestination, available: Bool, compact: Bool = false) -> some View {
         let receiverID: Receiver.ID? = if case .airplay(let id) = destination { id } else { nil }
-        let model = discovery.receivers.first { $0.id == receiverID }?.model?.lowercased() ?? ""
-        let outputIcon = if !destination.isAirPlay { "hifispeaker" }
-            else if model.hasPrefix("macbook") || destination.name.localizedCaseInsensitiveContains("MacBook") { "laptopcomputer" }
-            else if model.hasPrefix("mac") || model.hasPrefix("imac") { "desktopcomputer" }
-            else { "airplay.audio" }
+        let outputIcon = destination.outputSymbol(in: discovery)
         if let route = routes[destination.id] {
-            let owner = savedGroups.owner(of: destination.name) ?? synchronizedGroup
+            let currentRoute = receiverID.flatMap { workspace.airPlay.slots[$0]?.connection?.run.route }
+            let savedGroup = currentRoute.flatMap(workspace.savedGroupForRoute)
+            let owner = savedGroup.flatMap { savedGroups.session(for: $0.id) } ?? synchronizedGroup
             RouteRow(route: route, stream: route.stream, apps: apps, inputs: inputs,
                      available: available, simpleMode: simpleMode, outputIcon: outputIcon,
                      reconnecting: receiverID.map { workspace.isReconnecting(receiver: $0) } ?? false,
                      clock: clock, group: owner, groupStream: owner.stream,
-                     groupTitle: savedGroups.ownerName(of: destination.name),
-                     groupAttempt: receiverID.flatMap(savedGroups.latestAttempt(for:)),
                      receiverID: receiverID,
                      workspace: workspace,
                      savedGroups: savedGroups,
@@ -916,9 +939,68 @@ struct RoutingView: View {
                         set: { if $0 { workspace.groupSelection.insert(destination.id) } else { workspace.groupSelection.remove(destination.id) } }
                      ))
         } else {
-            Label(compact ? "\(destination.name) · недоступна" : destination.name,
+            Label(compact ? "\(destination.name) · unavailable" : destination.name,
                   systemImage: outputIcon).foregroundStyle(.secondary)
         }
+    }
+
+    private func verifyRoutingHandoff() async {
+        do {
+            guard let all = savedGroups.groups.first(where: { $0.name == "All Sonos" }),
+                  let vibe = savedGroups.groups.first(where: { $0.name == "Kitchen Vibe" }),
+                  let kitchen = all.members.first(where: { $0.name == "Kitchen" }),
+                  let living = all.members.first(where: { $0.name == "Living Room" }),
+                  vibe.members.contains(kitchen), !vibe.configuredInputs.isEmpty,
+                  let allSession = savedGroups.session(for: all.id),
+                  let vibeSession = savedGroups.session(for: vibe.id) else {
+                throw StreamError("Set up sources for All Sonos and Kitchen Vibe before running this check.")
+            }
+            try await waitForPTPTest("Kitchen and Living Room discovery") {
+                destinations.contains(.airplay(kitchen)) && destinations.contains(.airplay(living))
+            }
+            workspace.startSavedGroup(all, session: allSession)
+            try await waitForPTPTest("All Sonos startup", timeout: 75) {
+                workspace.airPlay.playing(.saved(all.id)).isSuperset(of: [kitchen, living])
+            }
+            let original = workspace.airPlay.slots[living]?.connection
+            print("HANDOFF_BASELINE Both speakers active")
+            fflush(nil)
+
+            workspace.attachSavedReceiver(kitchen, group: vibe, session: vibeSession, takeover: true)
+            try await waitForPTPTest("moving Kitchen to Kitchen Vibe", timeout: 75) {
+                workspace.airPlay.playing(.saved(vibe.id)).contains(kitchen)
+            }
+            guard workspace.airPlay.slots[living]?.connection == original else { throw StreamError("Living Room reconnected.") }
+            print("HANDOFF_TO_VIBE Kitchen active, Living Room session unchanged")
+            fflush(nil)
+
+            workspace.stopSavedGroup(vibe, session: vibeSession)
+            try await waitForPTPTest("returning Kitchen to All Sonos", timeout: 75) {
+                workspace.airPlay.playing(.saved(all.id)).contains(kitchen)
+            }
+            guard workspace.airPlay.slots[living]?.connection == original else { throw StreamError("Living Room reconnected.") }
+            print("HANDOFF_RETURN Kitchen restored, Living Room session unchanged")
+            fflush(nil)
+
+            workspace.stopReceiver(kitchen)
+            try await waitForPTPTest("stopping Kitchen manually") {
+                workspace.airPlay.slots[kitchen]?.connection == nil
+            }
+            try await Task.sleep(for: .seconds(2))
+            guard !workspace.airPlay.requested(kitchen, by: .saved(all.id)),
+                  workspace.airPlay.slots[kitchen]?.connection == nil else {
+                throw StreamError("Kitchen reconnected after a manual stop.")
+            }
+            workspace.attachSavedReceiver(kitchen, group: all, session: allSession)
+            try await waitForPTPTest("connecting Kitchen manually", timeout: 60) {
+                workspace.airPlay.playing(.saved(all.id)).contains(kitchen)
+            }
+            guard workspace.airPlay.slots[living]?.connection == original else { throw StreamError("Living Room reconnected.") }
+            print("HANDOFF_PASSED Manual stop and attach confirmed")
+        } catch {
+            print("HANDOFF_ERROR \(error.localizedDescription)")
+        }
+        fflush(nil)
     }
 
     private func startGroup() {
@@ -927,22 +1009,20 @@ struct RoutingView: View {
             .compactMap { routes[$0.id] }
         do {
             guard groupRoutes.count > 1, let first = groupRoutes.first else { return }
-            guard groupRoutes.allSatisfy({ route in
-                guard case .airplay(let receiver) = route.destination else { return false }
-                return !route.starting && !route.stream.active && savedGroups.owner(of: receiver.name) == nil &&
-                    workspace.receiverTransfers[receiver] == nil
-            }) else {
-                throw StreamError("Сначала останови индивидуальные маршруты выбранных колонок.")
-            }
             guard let choice = first.source, groupRoutes.allSatisfy({ $0.source == choice }) else {
-                throw StreamError("Выбери один и тот же источник во всех отмеченных строках.")
+                throw StreamError("Choose the same source for all selected outputs.")
             }
             if case .application = choice, !groupRoutes.allSatisfy({ $0.playLocally == first.playLocally }) {
-                throw StreamError("Установи одинаковое значение «Также на Mac» для всей группы.")
+                throw StreamError("Use the same “Also Play on This Mac” setting for every output in the group.")
             }
-            let (source, title) = try resolveSource(choice, apps: apps, inputs: inputs, playLocally: first.playLocally)
-            let levels = Dictionary(groupRoutes.map { ($0.destination.name, Int($0.volume.rounded())) }, uniquingKeysWith: { a, _ in a })
-            synchronizedGroup.start(source, title: title, volumes: levels, clock: clock)
+            let (source, _) = try resolveSource(choice, apps: apps, inputs: inputs, playLocally: first.playLocally)
+            let receivers = Set(groupRoutes.compactMap {
+                if case .airplay(let id) = $0.destination { id } else { nil }
+            })
+            workspace.airPlay.start(.quick, name: "Synchronized Group", receivers: receivers,
+                                   backend: .group(synchronizedGroup), source: source)
+            workspace.airPlay.reconcile(workspace)
+
         } catch {
             synchronizedGroup.error = error.localizedDescription
         }
@@ -977,8 +1057,8 @@ struct RoutingView: View {
                 }
                 try await Task.sleep(for: .milliseconds(100))
             }
-            guard let anchor = stream.scheduledStart, stream.receivers["Kitchen"] == "Передача",
-                  stream.receivers["Living Room"] == "Передача" else { throw StreamError("Shared start not confirmed") }
+            guard let anchor = stream.scheduledStart, stream.receivers["Kitchen"] == "Streaming",
+                  stream.receivers["Living Room"] == "Streaming" else { throw StreamError("Shared start not confirmed") }
             print("GROUP_SHARED_START \(anchor); LISTEN_IN_ABOUT_10_SECONDS")
             fflush(nil)
             try await Task.sleep(for: .seconds(4))
@@ -993,10 +1073,10 @@ struct RoutingView: View {
             print("GROUP_SOURCE_PEAK \(peak)")
             stream.stopReceiver("Kitchen")
             for _ in 0..<50 {
-                if stream.receivers["Kitchen"] == "Остановлено" { break }
+                if stream.receivers["Kitchen"] == "Stopped" { break }
                 try await Task.sleep(for: .milliseconds(100))
             }
-            guard stream.receivers["Kitchen"] == "Остановлено", stream.receivers["Living Room"] == "Передача",
+            guard stream.receivers["Kitchen"] == "Stopped", stream.receivers["Living Room"] == "Streaming",
                   stream.isTransmitting, clock.isRunning else { throw StreamError("Kitchen stop interrupted Living Room") }
             print("GROUP_KITCHEN_STOPPED_LIVING_ROOM_CONTINUES")
             fflush(nil)
@@ -1025,12 +1105,12 @@ struct RoutingView: View {
             guard SharedPTP.serviceInstalled,
                   let group = savedGroups.groups.first(where: { $0.name == "All Sonos" }),
                   let savedSession = savedGroups.session(for: group.id) else {
-                throw StreamError("Служба PTP или группа All Sonos не найдена.")
+                throw StreamError("The PTP service or All Sonos group was not found.")
             }
             session = savedSession
             let names = Set(group.members.map(\.name))
-            guard names == ["Kitchen", "Living Room"] else { throw StreamError("Неожиданный состав All Sonos.") }
-            try await waitForPTPTest("колонки и окно") {
+            guard names == ["Kitchen", "Living Room"] else { throw StreamError("All Sonos has unexpected outputs.") }
+            try await waitForPTPTest("outputs and main window") {
                 names.isSubset(of: Set(destinations.filter(\.isAirPlay).map(\.name))) &&
                     NSApp.windows.contains { $0.isVisible && $0.title == "Room Audio" }
             }
@@ -1038,7 +1118,7 @@ struct RoutingView: View {
             if testVolume {
                 for member in group.members {
                     guard let route = routes[.airplay(member)], let level = initialVolumes[member.name] else {
-                        throw StreamError("Колонка \(member.name) недоступна.")
+                        throw StreamError("\(member.name) is unavailable.")
                     }
                     workspace.setRouteVolume(Double(level), route: route)
                 }
@@ -1052,53 +1132,53 @@ struct RoutingView: View {
                 player = source
                 trigger = cue
                 let app = RunningAudioApp(id: source.processIdentifier, name: "PTP test \(index + 1)", bundleID: nil)
-                try await waitForPTPTest("аудиоисточник") { (try? app.audioObjects().isEmpty) == false }
+                try await waitForPTPTest("audio source") { (try? app.audioObjects().isEmpty) == false }
                 savedSession.start(.application(try app.audioObjects(), playLocally: false), title: app.name,
                                    volumes: initialVolumes, clock: clock, protectSonos: true)
-                try await waitForPTPTest("захват аудио") {
-                    savedSession.stream.status == "Синхронизация AirPlay…" ||
+                try await waitForPTPTest("audio capture") {
+                    savedSession.stream.status == "Synchronizing AirPlay…" ||
                         savedSession.stream.isTransmitting || (!savedSession.active && savedSession.error != nil)
                 }
                 try Data().write(to: cue)
-                try await waitForPTPTest("подключение обеих колонок") {
+                try await waitForPTPTest("both outputs connecting") {
                     savedSession.transmittingReceivers == names || (!savedSession.active && savedSession.error != nil)
                 }
                 guard savedSession.transmittingReceivers == names, clock.usesInstalledService,
                       let anchor = savedSession.stream.scheduledStart else {
-                    throw StreamError(savedSession.error ?? "Колонки не подтвердили старт через установленную службу.")
+                    throw StreamError(savedSession.error ?? "The outputs did not confirm startup through the installed service.")
                 }
                 print("ALL_SONOS_SOURCE_\(index + 1)_STARTED_WITHOUT_AUTHORIZATION_EVENT anchor=\(anchor)")
                 fflush(nil)
-                try await waitForPTPTest("звуковой сигнал") { savedSession.stream.signalLevel > 0.02 }
+                try await waitForPTPTest("audio signal") { savedSession.stream.signalLevel > 0.02 }
                 if testVolume {
                     try await verifyLiveGroupVolume(group, session: savedSession, anchor: anchor)
                 } else if index == 0 {
                     guard let window = NSApp.windows.first(where: { $0.isVisible && $0.title == "Room Audio" }) else {
-                        throw StreamError("Окно Room Audio не найдено.")
+                        throw StreamError("Room Audio window not found.")
                     }
                     window.performClose(nil)
-                    try await waitForPTPTest("закрытие окна") { !window.isVisible }
+                    try await waitForPTPTest("closing the window") { !window.isVisible }
                     var peak: Float = 0
                     for _ in 0..<35 {
                         guard savedSession.transmittingReceivers == names,
                               savedSession.stream.scheduledStart == anchor else {
-                            throw StreamError("После закрытия окна изменилась сессия All Sonos: \(savedSession.stream.status)")
+                            throw StreamError("The All Sonos session changed after the window closed: \(savedSession.stream.status)")
                         }
                         peak = max(peak, savedSession.stream.signalLevel)
                         try await Task.sleep(for: .milliseconds(120))
                     }
-                    guard peak > 0.02 else { throw StreamError("После закрытия окна не зафиксирован звуковой сигнал.") }
+                    guard peak > 0.02 else { throw StreamError("No audio signal was detected after the window closed.") }
                     print("WINDOW_CLOSED_BOTH_RECEIVERS_CONTINUED peak=\(peak)")
                     fflush(nil)
                     try await Task.sleep(for: .seconds(6))
                 } else {
                     try await Task.sleep(for: .seconds(12))
                     guard savedSession.transmittingReceivers == names else {
-                        throw StreamError("Второй источник не продолжил передачу на обе колонки.")
+                        throw StreamError("The second source did not continue streaming to both outputs.")
                     }
                 }
                 savedSession.stop()
-                try await waitForPTPTest("остановка группы") { !savedSession.active && !clock.isRunning }
+                try await waitForPTPTest("stopping the group") { !savedSession.active && !clock.isRunning }
                 if source.isRunning { source.terminate() }
                 try? FileManager.default.removeItem(at: cue)
             }
@@ -1109,7 +1189,7 @@ struct RoutingView: View {
         session?.stop()
         if let player, player.isRunning { player.terminate() }
         if let trigger { try? FileManager.default.removeItem(at: trigger) }
-        try? await waitForPTPTest("очистка после теста") { !clock.isRunning }
+        try? await waitForPTPTest("test cleanup") { !clock.isRunning }
         if passed && !clock.isRunning { print("PTP_SERVICE_TEST_PASSED_APP_STILL_RUNNING") }
         fflush(nil)
         if !passed || clock.isRunning { exit(1) }
@@ -1121,7 +1201,7 @@ struct RoutingView: View {
             let actual = workspace.groupVolumeLevels(for: group, session: session)
             guard actual.count == 2, actual.values.max() == Double(maximum),
                   actual.allSatisfy({ $0.value == Double(maximum) * ($0.key.name == "Kitchen" ? 0.5 : 1) }) else {
-                throw StreamError("Неверный баланс группы на уровне \(maximum)%.")
+                throw StreamError("Incorrect group balance at \(maximum)%.")
             }
             print("GROUP_VOLUME_SET \(maximum / 2) \(maximum) anchor=\(anchor)")
             fflush(nil)
@@ -1130,11 +1210,11 @@ struct RoutingView: View {
                 try await Task.sleep(for: .milliseconds(120))
                 guard session.transmittingReceivers == ["Kitchen", "Living Room"],
                       session.stream.scheduledStart == anchor else {
-                    throw StreamError("Передача прервалась на уровне \(maximum)%.")
+                    throw StreamError("Streaming was interrupted at \(maximum)%.")
                 }
                 peak = max(peak, session.stream.signalLevel)
             }
-            guard peak > 0.02 else { throw StreamError("Захват музыки пропал на уровне \(maximum)%.") }
+            guard peak > 0.02 else { throw StreamError("Audio capture was lost at \(maximum)%.") }
             print("GROUP_VOLUME_SIGNAL \(maximum) peak=\(peak)")
             fflush(nil)
         }
@@ -1144,7 +1224,7 @@ struct RoutingView: View {
     private func waitForPTPTest(_ stage: String, timeout: Int = 25, ready: () -> Bool) async throws {
         let deadline = ContinuousClock().now + .seconds(timeout)
         while !ready() {
-            guard ContinuousClock().now < deadline else { throw StreamError("Тайм-аут: \(stage).") }
+            guard ContinuousClock().now < deadline else { throw StreamError("Timed out waiting for \(stage).") }
             try await Task.sleep(for: .milliseconds(100))
         }
     }
@@ -1244,8 +1324,6 @@ private struct RouteRow: View {
     let clock: SharedPTP
     @ObservedObject var group: SynchronizedGroup
     @ObservedObject var groupStream: Streaming
-    let groupTitle: String?
-    let groupAttempt: (SpeakerGroup, SynchronizedGroup)?
     let receiverID: Receiver.ID?
     let workspace: RoutingWorkspace
     @ObservedObject var savedGroups: SpeakerGroups
@@ -1273,7 +1351,7 @@ private struct RouteRow: View {
                 }
                 Spacer()
                 if !simpleMode && route.destination.isAirPlay && available {
-                    Toggle("В группу", isOn: $groupSelected).toggleStyle(.checkbox)
+                    Toggle("Add to Group", isOn: $groupSelected).toggleStyle(.checkbox)
                         .disabled(!group.members.isEmpty || route.starting || stream.active)
                 }
                 if blockedByTV { forcePlay }
@@ -1281,15 +1359,15 @@ private struct RouteRow: View {
             }
             if !simpleMode && !inGroup {
                 HStack {
-                    RouteSourcePicker(title: route.starting || stream.active ? "Следующий источник" : "Источник",
+                    RouteSourcePicker(title: route.starting || stream.active ? "Next Source" : "Source",
                                       apps: apps, inputs: inputs, selection: $route.source)
                     if case .application = route.source {
-                        Toggle("Также на Mac", isOn: $route.playLocally).toggleStyle(.checkbox)
+                        Toggle("Also Play on This Mac", isOn: $route.playLocally).toggleStyle(.checkbox)
                     }
                 }
             }
             volumeControl
-            if !simpleMode || activityLabel != "Передача выключена" {
+            if !simpleMode || activityLabel != "Streaming off" {
                 HStack(spacing: 6) {
                     Text(activityLabel).foregroundStyle(.secondary).font(.caption)
                     if blockedByTV { editTVName }
@@ -1298,12 +1376,7 @@ private struct RouteRow: View {
             if let message = sourceError ?? route.error, message != activityLabel {
                 Text(message).foregroundStyle(.secondary).font(.caption)
             }
-            if (route.starting || stream.active || inGroup),
-               let (savedGroup, session) = groupAttempt, session !== group,
-               let reason = session.reason(for: route.destination.name) {
-                Text("Группа «\(savedGroup.name)» · при запуске: \(occupation(reason))")
-                    .foregroundStyle(.secondary).font(.caption)
-            }
+
         }
         .padding(.vertical, 6)
     }
@@ -1311,8 +1384,10 @@ private struct RouteRow: View {
     private var compactRow: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 8) {
-                volumeControl
-                transmissionControl.frame(width: 28)
+                volumeControl.disabled(!available)
+                transmissionControl
+                    .buttonStyle(CompactSpeakerButtonStyle())
+                    .frame(width: 28)
             }
             let status = compactStatus
             if blockedByTV || status != nil {
@@ -1329,17 +1404,13 @@ private struct RouteRow: View {
             }
         }
         .padding(.vertical, 2)
+        .grayscale(available ? 0 : 1)
+        .opacity(available ? 1 : 0.55)
     }
 
     private var compactStatus: String? {
-        let receiver = route.destination.name
-        if inGroup {
-            let title = groupTitle ?? "Синхронная группа"
-            if groupStream.stopping || groupStream.receivers[receiver] == "Остановка…" { return "Остановка…" }
-            return "Через \(title)"
-        }
-        if let error = sourceError ?? route.error { return error }
-        return activityLabel == "Передача выключена" ? nil : activityLabel
+        let status = activityLabel
+        return status == "Streaming off" ? nil : status
     }
 
     private var volumeControl: some View {
@@ -1352,73 +1423,73 @@ private struct RouteRow: View {
     }
 
     private var connecting: Bool {
-        reconnecting || route.isConnecting || group.isConnecting(to: route.destination.name)
+        if case .connecting = outputSlot?.state { return true }
+        return reconnecting || route.isConnecting
     }
 
     @ViewBuilder private var forcePlay: some View {
-        if let (group, session) = currentGroupAttempt, let receiverID {
+        if let receiverID, let run = outputSlot?.claims.first?.run {
             ForcePlayButton(receiver: route.destination.name) {
-                workspace.forcePlay(receiverID, group: group, session: session)
+                workspace.airPlay.attach(receiverID, to: run.route, takeover: true)
+                workspace.airPlay.reconcile(workspace)
             }
-            .disabled(session.stream.stopping || (session.active ? !session.stream.isTransmitting : group.configuredInputs.isEmpty))
         } else {
             ForcePlayButton(receiver: route.destination.name) { start(overrideTV: true) }
-                .disabled(route.source == nil)
+                .disabled(route.source == nil && !individualRequested)
         }
     }
 
     @ViewBuilder private var transmissionControl: some View {
         if inGroup {
-            let stopping = groupStream.receivers[route.destination.name] == "Остановка…" || groupStream.stopping
+            let stopping = groupStream.receivers[route.destination.name] == "Stopping…" || groupStream.stopping
             Button {
-                if let receiverID, groupTitle != nil {
-                    workspace.stopSavedGroupReceiver(receiverID, session: group)
-                } else {
-                    groupStream.stopReceiver(route.destination.name)
-                }
+                if let receiverID { workspace.stopReceiver(receiverID) }
             } label: {
-                transmissionLabel(stopping ? "Остановка…" : "Остановить", active: true, compact: simpleMode)
+                transmissionLabel(stopping ? "Stopping…" : "Stop", active: true, compact: simpleMode)
             }
-            .accessibilityLabel("Остановить \(route.destination.name)")
+            .accessibilityLabel("Stop \(route.destination.name)")
             .disabled(group.preparing || stopping)
-        } else if route.starting || stream.active {
-            Button(action: route.stop) {
-                transmissionLabel(stream.stopping ? "Остановка…" : "Остановить", active: true, compact: simpleMode)
+        } else if route.starting || stream.active || individualRequested {
+            Button(action: stopIndividual) {
+                transmissionLabel(stream.stopping ? "Stopping…" : "Stop", active: true, compact: simpleMode)
             }
-            .accessibilityLabel("Остановить \(route.destination.name)")
+            .accessibilityLabel("Stop \(route.destination.name)")
             .disabled(stream.stopping)
         } else {
-            let title = "Запустить"
+            let title = "Start"
             let button = Button {
                 start()
             } label: {
                 transmissionLabel(title, active: false, compact: simpleMode)
             }
             .accessibilityLabel("\(title) \(route.destination.name)")
-            .disabled(route.source == nil || !available || receiverID.map { workspace.receiverTransfers[$0] != nil } == true)
+            .disabled(route.source == nil || !available)
             if compact {
-                button.buttonStyle(.bordered)
+                button
             } else {
                 button.buttonStyle(.borderedProminent)
             }
         }
     }
 
-    private var inGroup: Bool { group.members.contains(route.destination.name) }
+    private var outputSlot: OutputSlot? {
+        receiverID.flatMap { workspace.airPlay.slots[$0] }
+    }
+
+    private var inGroup: Bool {
+        guard let route = outputSlot?.connection?.run.route else { return false }
+        if case .individual = route { return false }
+        return true
+    }
 
     private var normalizedSignal: Double {
         let peak = Double(inGroup ? groupStream.signalLevel : stream.signalLevel)
         return peak > 0 ? max(0, min(1, (20 * log10(peak) + 60) / 60)) : 0
     }
 
-    private var currentGroupAttempt: (SpeakerGroup, SynchronizedGroup)? {
-        guard let groupAttempt, groupAttempt.1.attemptedAt >= route.attemptedAt else { return nil }
-        return groupAttempt
-    }
-
     private var blockedByTV: Bool {
-        guard available, !inGroup, !route.starting, !stream.active else { return false }
-        return (currentGroupAttempt?.1.stream ?? stream).receiversBlockedByTV.contains(route.destination.name)
+        if case .external(let external, _) = outputSlot?.availability { return external.kind == .tv }
+        return false
     }
 
     private var editTVName: some View {
@@ -1429,13 +1500,13 @@ private struct RouteRow: View {
             Image(systemName: "pencil")
         }
         .buttonStyle(.borderless)
-        .accessibilityLabel("Имя устройства на ТВ-входе \(route.destination.name)")
-        .help("Указать имя устройства на ТВ-входе")
+        .accessibilityLabel("TV input device name for \(route.destination.name)")
+        .help("Name the TV input device")
         .popover(isPresented: $editingTVName) {
             VStack(alignment: .leading, spacing: 8) {
-                Text("Устройство на ТВ-входе").font(.headline)
-                TextField("Например, LG OLED", text: $tvName)
-                Button("Сохранить") {
+                Text("TV Input Device").font(.headline)
+                TextField("For example, LG OLED", text: $tvName)
+                Button("Save") {
                     savedGroups.setTVDeviceName(tvName, for: route.destination.name)
                     editingTVName = false
                 }.keyboardShortcut(.defaultAction)
@@ -1444,55 +1515,63 @@ private struct RouteRow: View {
         }
     }
 
-    private func occupation(_ reason: String) -> String {
-        reason == tvInputBusyMessage ? savedGroups.tvOccupation(for: route.destination.name) : reason
+    private var activityLabel: String {
+        if let sourceError { return sourceError }
+        if !available { return "Output unavailable" }
+        if let slot = outputSlot {
+            switch slot.availability {
+            case .offline: return "Output unavailable"
+            case .external(let external, _):
+                return external.kind == .tv ? savedGroups.tvOccupation(for: route.destination.name) : external.description
+            case .unsupported(let reason): return reason
+            case .unknown: return "Checking availability…"
+            case .available: break
+            }
+            switch slot.state {
+            case .connected(let connection):
+                return inGroup && !compact ? "Via \(connection.run.name)" : connection.run.name
+            case .connecting(let connection): return "\(connection.run.name) · Connecting…"
+            case .releasing: return "Stopping…"
+            case .retry(_, let reason): return reason
+            case .idle: return "Waiting to connect"
+            }
+        }
+        if let error = route.error { return error }
+        if stream.active { return [route.runningSourceName, stream.status].compactMap { $0 }.joined(separator: " · ") }
+        return "Streaming off"
     }
 
-    private var activityLabel: String {
-        let receiver = route.destination.name
-        if inGroup {
-            let status: String
-            if group.transmittingReceivers.contains(receiver) {
-                status = "Подключена"
-            } else if group.preparing {
-                status = "Подготовка…"
-            } else {
-                status = groupStream.receivers[receiver] == "Передача" && !groupStream.stopping
-                    ? "Синхронизация" : groupStream.stopping ? "Остановка…" : groupStream.receivers[receiver] ?? groupStream.status
-            }
-            let title = groupTitle.map { "Группа «\($0)»" } ?? "Синхронная группа"
-            return [title, group.sourceName, status].compactMap { $0 }.joined(separator: " · ")
+    private var individualRequested: Bool {
+        receiverID.map { workspace.airPlay.runs[.individual($0)] != nil } ?? false
+    }
+
+    private func stopIndividual() {
+        if let receiverID {
+            workspace.airPlay.stop(.individual(receiverID))
+            workspace.airPlay.reconcile(workspace)
+        } else {
+            route.stop()
         }
-        if !route.starting, !stream.active {
-            if let (group, session) = currentGroupAttempt {
-                if let reason = session.reason(for: receiver) {
-                    return "Группа «\(group.name)» · при запуске: \(occupation(reason))"
-                }
-                if session.active {
-                    return "Группа «\(group.name)» · передача на эту колонку выключена"
-                }
-                return available ? "Передача выключена" : "Колонка недоступна"
-            }
-            if let reason = stream.skippedReceivers[receiver] { return occupation(reason) }
-        }
-        let status = route.starting ? "Подготовка…" : stream.status
-        if (route.starting || stream.active), let name = route.runningSourceName {
-            if stream.isTransmitting && !stream.stopping && !stream.hasRecentSignal {
-                return "\(name) · нет сигнала от источника"
-            }
-            return "\(name) · \(status)"
-        }
-        if !available { return "Колонка недоступна" }
-        return status == "Готово к запуску" ? "Передача выключена" : status
     }
 
     private func start(overrideTV: Bool = false) {
-        if let receiverID, workspace.receiverTransfers[receiverID] != nil { return }
         sourceError = nil
+        if overrideTV, let receiverID, workspace.airPlay.runs[.individual(receiverID)] != nil {
+            workspace.airPlay.attach(receiverID, to: .individual(receiverID), takeover: true)
+            workspace.airPlay.reconcile(workspace)
+            return
+        }
         do {
             guard let choice = route.source else { return }
             let (source, name) = try resolveSource(choice, apps: apps, inputs: inputs, playLocally: route.playLocally)
-            route.start(source, name: name, clock: clock, overrideTV: overrideTV)
+            if let receiverID {
+                let key = AirPlayRoute.individual(receiverID)
+                workspace.airPlay.start(key, name: name, receivers: [receiverID], backend: .individual(route),
+                                        source: source, takeover: overrideTV ? receiverID : nil)
+                workspace.airPlay.reconcile(workspace)
+            } else {
+                route.start(source, name: name, clock: clock, overrideTV: overrideTV)
+            }
         } catch {
             sourceError = error.localizedDescription
         }
@@ -1506,6 +1585,34 @@ func transmissionLabel(_ title: String, active: Bool, compact: Bool) -> some Vie
             .help(title)
     } else {
         Text(title)
+    }
+}
+
+private struct CompactSpeakerButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        CompactSpeakerButton(label: configuration.label, pressed: configuration.isPressed)
+    }
+
+    private struct CompactSpeakerButton<Label: View>: View {
+        let label: Label
+        let pressed: Bool
+        @Environment(\.isEnabled) private var enabled
+        @Environment(\.isFocused) private var focused
+        @State private var hovering = false
+
+        var body: some View {
+            label
+                .frame(width: 28, height: 22)
+                .foregroundStyle(enabled ? Color.primary : Color.secondary)
+                .background {
+                    if enabled && (hovering || focused || pressed) {
+                        RoundedRectangle(cornerRadius: 5)
+                            .fill(Color.primary.opacity(pressed ? 0.18 : 0.10))
+                    }
+                }
+                .contentShape(Rectangle())
+                .onHover { hovering = $0 }
+        }
     }
 }
 
@@ -1541,10 +1648,10 @@ struct VolumeSlider: View {
 
     @ViewBuilder private var slider: some View {
         if caption == nil && !hidesCaption {
-            Slider(value: $value, in: 0...100, step: 1) { Text("Громкость \(name)") }
+            Slider(value: $value, in: 0...100, step: 1) { Text("Volume \(name)") }
         } else {
             Slider(value: Binding(get: { value }, set: { value = $0.rounded() }), in: 0...100) {
-                Text("Громкость \(name)")
+                Text("Volume \(name)")
             }
         }
     }
@@ -1568,13 +1675,13 @@ struct VolumeSlider: View {
             }
             slider
                 .labelsHidden()
-                .accessibilityLabel("Громкость \(name)")
+                .accessibilityLabel("Volume \(name)")
             Text(available ? "\(Int(value.rounded()))%" : "—")
                 .monospacedDigit().frame(width: 38, alignment: .trailing)
             if showsSignalColumn {
                 if let signal {
                     ProgressView(value: signal).frame(width: 64)
-                        .accessibilityLabel("Сигнал \(name)")
+                        .accessibilityLabel("Signal \(name)")
                 } else {
                     Color.clear.frame(width: 64, height: 1).accessibilityHidden(true)
                 }
@@ -1588,7 +1695,7 @@ struct ConnectionIcon: View {
     let reconnecting: Bool
 
     var body: some View {
-        let title = reconnecting ? "Переподключение" : "Подключение"
+        let title = reconnecting ? "Reconnecting" : "Connecting"
         Image(systemName: Self.symbol)
             .foregroundStyle(.orange)
             .accessibilityLabel(title)
@@ -1601,10 +1708,10 @@ func resolveSource(_ choice: RouteSourceChoice, apps: [RunningAudioApp], inputs:
                            playLocally: Bool) throws -> (AudioSource, String) {
     switch choice {
     case .application(let pid):
-        guard let app = apps.first(where: { $0.id == pid }) ?? RunningAudioApp.list().first(where: { $0.id == pid }) else { throw StreamError("Приложение закрыто, выбери источник заново.") }
+        guard let app = apps.first(where: { $0.id == pid }) ?? RunningAudioApp.list().first(where: { $0.id == pid }) else { throw StreamError("The app is closed. Choose a source again.") }
         return (.application(try app.audioObjects(), playLocally: playLocally), app.name)
     case .device(let id):
-        guard let input = inputs.first(where: { $0.id == id }) else { throw StreamError("Аудиоустройство недоступно.") }
+        guard let input = inputs.first(where: { $0.id == id }) else { throw StreamError("Audio device unavailable.") }
         return (.device(id), input.name)
     }
 }

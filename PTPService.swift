@@ -33,10 +33,10 @@ private final class ClockDaemon: NSObject, NSXPCListenerDelegate, @unchecked Sen
     }
 
     func start(_ address: String, for connection: NSXPCConnection) -> String? {
-        guard localAddress(address) else { return "PTP требует локальный IPv4-адрес интерфейса." }
+        guard localAddress(address) else { return "PTP requires a local IPv4 interface address." }
         return lock.withLock {
             if owner === connection, clock?.isRunning == true { return nil }
-            guard clock?.isRunning != true else { return "Служба PTP уже обслуживает другую сессию." }
+            guard clock?.isRunning != true else { return "The PTP service is already in use by another session." }
             let process = Process()
             process.executableURL = URL(fileURLWithPath: installedDirectory + "/cliairplay")
             process.arguments = ["--ptp-daemon", "--if", address]
@@ -48,7 +48,7 @@ private final class ClockDaemon: NSObject, NSXPCListenerDelegate, @unchecked Sen
                 clock = process
                 return nil
             } catch {
-                return "Не удалось запустить часы PTP: \(error.localizedDescription)"
+                return "Could not start the PTP clock: \(error.localizedDescription)"
             }
         }
     }
@@ -100,7 +100,7 @@ private final class ClockClientSession: NSObject, ClockService {
     }
 
     func start(_ address: String, reply: @escaping (String?) -> Void) {
-        guard let connection else { reply("Соединение со службой PTP закрыто."); return }
+        guard let connection else { reply("The connection to the PTP service is closed."); return }
         reply(daemon.start(address, for: connection))
     }
 
@@ -123,7 +123,15 @@ private func connect(address: String) -> Int32 {
     } as! ClockService
     proxy.start(address) { problem = $0 }
     if let problem {
-        FileHandle.standardError.write(Data((problem + "\n").utf8))
+        // Older installed daemons can still return these Russian messages over XPC.
+        let messages = [
+            "PTP требует локальный IPv4-адрес интерфейса.": "PTP requires a local IPv4 interface address.",
+            "Служба PTP уже обслуживает другую сессию.": "The PTP service is already in use by another session.",
+            "Соединение со службой PTP закрыто.": "The connection to the PTP service is closed."
+        ]
+        let message = messages[problem] ?? problem.replacingOccurrences(
+            of: "Не удалось запустить часы PTP:", with: "Could not start the PTP clock:")
+        FileHandle.standardError.write(Data((message + "\n").utf8))
         return 1
     }
     _ = FileHandle.standardInput.readDataToEndOfFile()
@@ -172,7 +180,7 @@ private func install(transport: String) throws {
     """
     let approval = """
     on run argv
-        do shell script (item 1 of argv) with prompt "Room Audio: одноразовая установка службы синхронизации AirPlay." with administrator privileges
+        do shell script (item 1 of argv) with prompt "Room Audio needs administrator approval to install the AirPlay sync service." with administrator privileges
     end run
     """
     let process = Process()

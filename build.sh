@@ -17,7 +17,7 @@ fi
 actual=$(shasum -a 256 "$transport")
 [ "${actual%% *}" = 'de19cc204837640301061a088459ed72e2aa10a352c9040f9e26f9dbb10f7c3a' ]
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Resources"
-swiftc -swift-version 6 -warnings-as-errors -parse-as-library RoomAudio.swift Streaming.swift AppAudio.swift LocalOutput.swift Routing.swift SourcePicker.swift SavedGroups.swift Mixer.swift GroupEditor.swift -o "$bundle/Contents/MacOS/RoomAudio"
+swiftc -swift-version 6 -warnings-as-errors -parse-as-library RoomAudio.swift Streaming.swift AppAudio.swift LocalOutput.swift Routing.swift SourcePicker.swift SavedGroups.swift Mixer.swift GroupEditor.swift AirPlayRouting.swift -o "$bundle/Contents/MacOS/RoomAudio"
 swiftc -swift-version 6 -warnings-as-errors PTPService.swift -o "$bundle/Contents/Resources/PTPService"
 cp "$transport" "$bundle/Contents/Resources/cliairplay"
 chmod 755 "$bundle/Contents/Resources/cliairplay"

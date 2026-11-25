@@ -14,6 +14,7 @@ struct MixInput: Equatable {
 struct MixInputStatus: Equatable {
     var hasSignal = false
     var error: String?
+    var captured = false
 }
 
 // The Core Audio callback writes once. The mixer queue is the sole reader.
@@ -128,7 +129,7 @@ private final class MixRenderer: @unchecked Sendable {
         let flags = fcntl(fd, F_GETFL)
         guard flags >= 0, fcntl(fd, F_SETNOSIGPIPE, 1) >= 0,
               fcntl(fd, F_SETFL, flags | O_NONBLOCK) >= 0 else {
-            throw StreamError("Не удалось открыть канал микшера")
+            throw StreamError("Could not open the mixer pipe")
         }
         samples = .allocate(capacity: Self.chunk * 2)
         pcm = .allocate(capacity: Self.chunk * 2)
@@ -218,19 +219,114 @@ private final class MixRenderer: @unchecked Sendable {
     }
 }
 
+struct AudioCaptureError: LocalizedError {
+    let status: OSStatus
+    let operation: String
+
+    var errorDescription: String? {
+        if status == kAudioDevicePermissionsError {
+            return "Allow Room Audio to capture audio in System Settings."
+        }
+        return "\(operation) (Core Audio: \(status))"
+    }
+}
+
 @MainActor
-final class GroupMixer {
-    private struct Slot {
+private final class InputSlot {
+    struct CaptureSession {
         let source: AudioSource
         let capture: Capture
         let tap: AppAudioTap?
         let channel: MixChannel
     }
 
+    enum State {
+        case waiting(String?)
+        case opening
+        case captured(CaptureSession)
+        case retry(Date, String)
+        case permission(String)
+    }
+
+    let id: String
+    private(set) var state: State = .waiting(nil)
+    private var configuration: MixInput?
+    private var source: AudioSource?
+    private var retryCount = 0
+
+    init(id: String) { self.id = id }
+
+    var gain: Float {
+        guard let configuration, !configuration.muted, configuration.gain.isFinite else { return 0 }
+        return Float(max(0, min(100, configuration.gain))) / 100
+    }
+
+    var channel: MixChannel? {
+        if case .captured(let session) = state { return session.channel }
+        return nil
+    }
+
+    func update(_ input: MixInput, now: Date, open: ((AudioSource) throws -> CaptureSession)? = nil) {
+        guard input.id == id else { return }
+        configuration = input
+        if source != input.source {
+            stop()
+            source = input.source
+        }
+        guard let source else {
+            state = .waiting(input.unavailable)
+            return
+        }
+        switch state {
+        case .captured, .opening, .permission: return
+        case .retry(let deadline, _) where now < deadline: return
+        case .waiting, .retry: break
+        }
+
+        state = .opening
+        do {
+            state = .captured(try (open ?? Self.open)(source))
+            retryCount = 0
+        } catch let error as AudioCaptureError where error.status == kAudioDevicePermissionsError {
+            state = .permission(error.localizedDescription)
+        } catch {
+            let delays: [TimeInterval] = [3, 5, 8, 15, 25]
+            let delay = delays[min(retryCount, delays.count - 1)]
+            retryCount = min(retryCount + 1, delays.count - 1)
+            state = .retry(now.addingTimeInterval(delay), error.localizedDescription)
+        }
+    }
+
+    private static func open(_ source: AudioSource) throws -> CaptureSession {
+        let ring = MixInputBuffer()
+        let (capture, tap) = try Capture.make(source, fd: nil, mixInput: ring)
+        try capture.start()
+        return CaptureSession(source: source, capture: capture, tap: tap,
+                              channel: MixChannel(ring: ring, inputRate: capture.sampleRate))
+    }
+
+    func stop() {
+        if case .captured(let session) = state { session.capture.stop() }
+        state = .waiting(nil)
+        source = nil
+        retryCount = 0
+    }
+
+    func status(hasSignal: Bool) -> MixInputStatus {
+        switch state {
+        case .captured: MixInputStatus(hasSignal: hasSignal, captured: true)
+        case .waiting(let reason): MixInputStatus(error: reason)
+        case .opening: MixInputStatus(error: "Connecting input…")
+        case .retry(_, let reason), .permission(let reason): MixInputStatus(error: reason)
+        }
+    }
+}
+
+@MainActor
+final class GroupMixer {
     private let renderer: MixRenderer
-    private var slots: [String: Slot] = [:]
-    private var errors: [String: String] = [:]
-    private var configuration: [MixInput]?
+    private var slots: [String: InputSlot] = [:]
+    private var configuration: [MixInput] = []
     private var running = false
 
     var sampleRate: Int { MixRenderer.sampleRate }
@@ -239,16 +335,14 @@ final class GroupMixer {
     init(fd: Int32) throws { renderer = try MixRenderer(fd: fd) }
 
     func update(_ inputs: [MixInput]) {
-        guard inputs != configuration else { return }
         configuration = inputs
-        guard running else { return }
-        reconcile(inputs)
+        if running { reconcile() }
     }
 
     func start() {
         guard !running else { return }
         running = true
-        reconcile(configuration ?? [])
+        reconcile()
         renderer.start()
     }
 
@@ -257,41 +351,57 @@ final class GroupMixer {
         running = false
         renderer.stop()
         renderer.setChannels([:], gains: [:])
-        for slot in slots.values { slot.capture.stop() }
+        for slot in slots.values { slot.stop() }
         slots.removeAll()
-        errors.removeAll()
     }
 
     func meter() -> (Float, [String: MixInputStatus]) {
         let (peak, signals) = renderer.meter()
-        var states = errors.mapValues { MixInputStatus(error: $0) }
-        for (id, _) in slots { states[id] = MixInputStatus(hasSignal: signals.contains(id)) }
-        return (peak, states)
+        let statuses = Dictionary(uniqueKeysWithValues: slots.map { id, slot in
+            (id, slot.status(hasSignal: signals.contains(id)))
+        })
+        return (peak, statuses)
     }
 
-    private func reconcile(_ inputs: [MixInput]) {
-        let wanted = Dictionary(inputs.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        for id in Array(slots.keys) where slots[id]?.source != wanted[id]?.source {
-            slots.removeValue(forKey: id)?.capture.stop()
-        }
-        errors = [:]
-        var gains: [String: Float] = [:]
+    private func reconcile(now: Date = .now) {
+        let wanted = Dictionary(configuration.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for id in Array(slots.keys) where wanted[id] == nil { slots.removeValue(forKey: id)?.stop() }
         for (id, input) in wanted {
-            guard let source = input.source else {
-                errors[id] = input.unavailable
-                continue
-            }
-            if slots[id] == nil {
-                do {
-                    let ring = MixInputBuffer()
-                    let (capture, tap) = try Capture.make(source, fd: nil, mixInput: ring)
-                    try capture.start()
-                    slots[id] = Slot(source: source, capture: capture, tap: tap,
-                                     channel: MixChannel(ring: ring, inputRate: capture.sampleRate))
-                } catch { errors[id] = error.localizedDescription }
-            }
-            gains[id] = input.muted || !input.gain.isFinite ? 0 : Float(max(0, min(100, input.gain))) / 100
+            let slot = slots[id] ?? InputSlot(id: id)
+            slots[id] = slot
+            slot.update(input, now: now)
         }
-        renderer.setChannels(slots.mapValues(\.channel), gains: gains)
+        renderer.setChannels(slots.compactMapValues(\.channel), gains: slots.mapValues(\.gain))
     }
+}
+
+@MainActor
+func verifyInputSlotTransitions() -> Bool {
+    let slot = InputSlot(id: "device:stable-uid")
+    let now = Date(timeIntervalSince1970: 0)
+    let config = MixInput(id: slot.id, source: .device(1), gain: 74, muted: true, unavailable: nil)
+    var opened: [AudioSource] = []
+    let temporary: (AudioSource) throws -> InputSlot.CaptureSession = { source in
+        opened.append(source)
+        throw AudioCaptureError(status: kAudioHardwareNotReadyError, operation: "Input is still unavailable")
+    }
+    slot.update(config, now: now, open: temporary)
+    slot.update(config, now: now + 2, open: temporary)
+    slot.update(config, now: now + 3, open: temporary)
+    guard opened == [.device(1), .device(1)] else { return false }
+    let absent = MixInput(id: slot.id, source: nil, gain: 74, muted: true, unavailable: "Input unavailable")
+    slot.update(absent, now: now + 4, open: temporary)
+    guard slot.status(hasSignal: false).error == "Input unavailable" else { return false }
+    let returned = MixInput(id: slot.id, source: .device(2), gain: 74, muted: true, unavailable: nil)
+    slot.update(returned, now: now + 5) { source in
+        opened.append(source)
+        throw AudioCaptureError(status: kAudioDevicePermissionsError, operation: "Opening input")
+    }
+    slot.update(returned, now: now + 99, open: temporary)
+    guard opened == [.device(1), .device(1), .device(2)], slot.gain == 0,
+          slot.status(hasSignal: false).error == "Allow Room Audio to capture audio in System Settings." else { return false }
+    slot.stop()
+    guard slot.channel == nil else { return false }
+    print("INPUT_RETRY_REBIND_PERMISSION_AND_MUTE")
+    return true
 }
